@@ -1,7 +1,7 @@
 use crate::cluster::ClusterConnection;
 use crate::cmd::{cmd, Cmd};
 use crate::types::{
-    from_redis_value, ErrorKind, FromRedisValue, HashSet, RedisResult, ToRedisArgs, Value,
+    from_owned_redis_value, ErrorKind, FromRedisValue, HashSet, RedisResult, ToRedisArgs, Value,
 };
 
 pub(crate) const UNROUTABLE_ERROR: (ErrorKind, &str) = (
@@ -118,13 +118,11 @@ impl ClusterPipeline {
             }
         }
 
-        from_redis_value(
-            &(if self.commands.is_empty() {
-                Value::Bulk(vec![])
-            } else {
-                self.make_pipeline_results(con.execute_pipeline(self)?)
-            }),
-        )
+        from_owned_redis_value(if self.commands.is_empty() {
+            Value::Array(vec![])
+        } else {
+            self.make_pipeline_results(con.execute_pipeline(self)?)?
+        })
     }
 
     /// This is a shortcut to `query()` that does not return a value and
@@ -137,11 +135,21 @@ impl ClusterPipeline {
     /// # let client = redis::cluster::ClusterClient::new(nodes).unwrap();
     /// # let mut con = client.get_connection().unwrap();
     /// let mut pipe = redis::cluster::cluster_pipe();
-    /// let _ : () = pipe.cmd("SET").arg("key_1").arg(42).ignore().query(&mut con).unwrap();
+    /// pipe.cmd("SET").arg("key_1").arg(42).ignore().query::<()>(&mut con).unwrap();
     /// ```
     #[inline]
+    #[deprecated(note = "Use Cmd::exec + unwrap, instead")]
     pub fn execute(&self, con: &mut ClusterConnection) {
-        self.query::<()>(con).unwrap();
+        self.exec(con).unwrap();
+    }
+
+    /// This is an alternative to `query`` that can be used if you want to be able to handle a
+    /// command's success or failure but don't care about the command's response. For example,
+    /// this is useful for "SET" commands for which the response's content is not important.
+    /// It avoids the need to define generic bounds for ().
+    #[inline]
+    pub fn exec(&self, con: &mut ClusterConnection) -> RedisResult<()> {
+        self.query::<()>(con)
     }
 }
 

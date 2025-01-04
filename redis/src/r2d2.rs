@@ -1,5 +1,6 @@
-use std::io;
-
+#[cfg(feature = "sentinel")]
+use crate::sentinel::LockedSentinelClient;
+use crate::types::closed_connection_error;
 use crate::{ConnectionLike, RedisError};
 
 macro_rules! impl_manage_connection {
@@ -16,7 +17,7 @@ macro_rules! impl_manage_connection {
                 if conn.check_connection() {
                     Ok(())
                 } else {
-                    Err(RedisError::from(io::Error::from(io::ErrorKind::BrokenPipe)))
+                    Err(closed_connection_error())
                 }
             }
 
@@ -34,3 +35,6 @@ impl_manage_connection!(
     crate::cluster::ClusterClient,
     crate::cluster::ClusterConnection
 );
+
+#[cfg(feature = "sentinel")]
+impl_manage_connection!(LockedSentinelClient, crate::Connection);

@@ -125,7 +125,7 @@ fn test_acl_cat() {
         assert!(res.contains(*cat), "Category `{cat}` does not exist");
     }
 
-    let expects = vec!["pfmerge", "pfcount", "pfselftest", "pfadd"];
+    let expects = ["pfmerge", "pfcount", "pfselftest", "pfadd"];
     let res: HashSet<String> = con
         .acl_cat_categoryname("hyperloglog")
         .expect("Got commands of a category");
@@ -152,4 +152,35 @@ fn test_acl_log() {
     let logs: Vec<Value> = con.acl_log(1).expect("Got logs");
     assert_eq!(logs.len(), 0);
     assert_eq!(con.acl_log_reset(), Ok(()));
+}
+
+#[test]
+fn test_acl_dryrun() {
+    let ctx = TestContext::new();
+    if ctx.get_version() < (7, 0, 0) {
+        return;
+    }
+
+    let mut con = ctx.connection();
+
+    redis::cmd("ACL")
+        .arg("SETUSER")
+        .arg("VIRGINIA")
+        .arg("+SET")
+        .arg("~*")
+        .exec(&mut con)
+        .unwrap();
+
+    assert_eq!(
+        con.acl_dryrun(b"VIRGINIA", String::from("SET"), &["foo", "bar"]),
+        Ok(())
+    );
+
+    let res: String = con
+        .acl_dryrun(b"VIRGINIA", String::from("GET"), "foo")
+        .unwrap();
+    assert_eq!(
+        res,
+        "User VIRGINIA has no permissions to run the 'get' command"
+    );
 }

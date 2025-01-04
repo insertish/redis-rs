@@ -1,17 +1,21 @@
 use std::time::Duration;
 
 #[cfg(feature = "aio")]
-use std::pin::Pin;
-
+use crate::aio::AsyncPushSender;
 use crate::{
     connection::{connect, Connection, ConnectionInfo, ConnectionLike, IntoConnectionInfo},
     types::{RedisResult, Value},
 };
+#[cfg(feature = "aio")]
+use std::pin::Pin;
+
+#[cfg(feature = "tls-rustls")]
+use crate::tls::{inner_build_with_tls, TlsCertificates};
 
 /// The client type.
 #[derive(Debug, Clone)]
 pub struct Client {
-    connection_info: ConnectionInfo,
+    pub(crate) connection_info: ConnectionInfo,
 }
 
 /// The client acts as connector to the redis server.  By itself it does not
@@ -62,6 +66,162 @@ impl Client {
     pub fn get_connection_info(&self) -> &ConnectionInfo {
         &self.connection_info
     }
+
+    /// Constructs a new `Client` with parameters necessary to create a TLS connection.
+    ///
+    /// - `conn_info` - URL using the `rediss://` scheme.
+    /// - `tls_certs` - `TlsCertificates` structure containing:
+    ///     - `client_tls` - Optional `ClientTlsConfig` containing byte streams for
+    ///         - `client_cert` - client's byte stream containing client certificate in PEM format
+    ///         - `client_key` - client's byte stream containing private key in PEM format
+    ///     - `root_cert` - Optional byte stream yielding PEM formatted file for root certificates.
+    ///
+    /// If `ClientTlsConfig` ( cert+key pair ) is not provided, then client-side authentication is not enabled.
+    /// If `root_cert` is not provided, then system root certificates are used instead.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use std::{fs::File, io::{BufReader, Read}};
+    ///
+    /// use redis::{Client, AsyncCommands as _, TlsCertificates, ClientTlsConfig};
+    ///
+    /// async fn do_redis_code(
+    ///     url: &str,
+    ///     root_cert_file: &str,
+    ///     cert_file: &str,
+    ///     key_file: &str
+    /// ) -> redis::RedisResult<()> {
+    ///     let root_cert_file = File::open(root_cert_file).expect("cannot open private cert file");
+    ///     let mut root_cert_vec = Vec::new();
+    ///     BufReader::new(root_cert_file)
+    ///         .read_to_end(&mut root_cert_vec)
+    ///         .expect("Unable to read ROOT cert file");
+    ///
+    ///     let cert_file = File::open(cert_file).expect("cannot open private cert file");
+    ///     let mut client_cert_vec = Vec::new();
+    ///     BufReader::new(cert_file)
+    ///         .read_to_end(&mut client_cert_vec)
+    ///         .expect("Unable to read client cert file");
+    ///
+    ///     let key_file = File::open(key_file).expect("cannot open private key file");
+    ///     let mut client_key_vec = Vec::new();
+    ///     BufReader::new(key_file)
+    ///         .read_to_end(&mut client_key_vec)
+    ///         .expect("Unable to read client key file");
+    ///
+    ///     let client = Client::build_with_tls(
+    ///         url,
+    ///         TlsCertificates {
+    ///             client_tls: Some(ClientTlsConfig{
+    ///                 client_cert: client_cert_vec,
+    ///                 client_key: client_key_vec,
+    ///             }),
+    ///             root_cert: Some(root_cert_vec),
+    ///         }
+    ///     )
+    ///     .expect("Unable to build client");
+    ///
+    ///     let connection_info = client.get_connection_info();
+    ///
+    ///     println!(">>> connection info: {connection_info:?}");
+    ///
+    ///     let mut con = client.get_multiplexed_async_connection().await?;
+    ///
+    ///     con.set("key1", b"foo").await?;
+    ///
+    ///     redis::cmd("SET")
+    ///         .arg(&["key2", "bar"])
+    ///         .exec_async(&mut con)
+    ///         .await?;
+    ///
+    ///     let result = redis::cmd("MGET")
+    ///         .arg(&["key1", "key2"])
+    ///         .query_async(&mut con)
+    ///         .await;
+    ///     assert_eq!(result, Ok(("foo".to_string(), b"bar".to_vec())));
+    ///     println!("Result from MGET: {result:?}");
+    ///
+    ///     Ok(())
+    /// }
+    /// ```
+    #[cfg(feature = "tls-rustls")]
+    pub fn build_with_tls<C: IntoConnectionInfo>(
+        conn_info: C,
+        tls_certs: TlsCertificates,
+    ) -> RedisResult<Client> {
+        let connection_info = conn_info.into_connection_info()?;
+
+        inner_build_with_tls(connection_info, tls_certs)
+    }
+}
+
+/// Options for creation of async connection
+#[cfg(feature = "aio")]
+#[derive(Clone, Default)]
+pub struct AsyncConnectionConfig {
+    /// Maximum time to wait for a response from the server
+    pub(crate) response_timeout: Option<std::time::Duration>,
+    /// Maximum time to wait for a connection to be established
+    pub(crate) connection_timeout: Option<std::time::Duration>,
+    pub(crate) push_sender: Option<std::sync::Arc<dyn AsyncPushSender>>,
+}
+
+#[cfg(feature = "aio")]
+impl AsyncConnectionConfig {
+    /// Creates a new instance of the options with nothing set
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Sets the connection timeout
+    pub fn set_connection_timeout(mut self, connection_timeout: std::time::Duration) -> Self {
+        self.connection_timeout = Some(connection_timeout);
+        self
+    }
+
+    /// Sets the response timeout
+    pub fn set_response_timeout(mut self, response_timeout: std::time::Duration) -> Self {
+        self.response_timeout = Some(response_timeout);
+        self
+    }
+
+    /// Sets sender sender for push values.
+    ///
+    /// The sender can be a channel, or an arbitrary function that handles [crate::PushInfo] values.
+    /// This will fail client creation if the connection isn't configured for RESP3 communications via the [crate::RedisConnectionInfo::protocol] field.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # use redis::AsyncConnectionConfig;
+    /// let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    /// let config = AsyncConnectionConfig::new().set_push_sender(tx);
+    /// ```
+    ///
+    /// ```rust
+    /// # use std::sync::{Mutex, Arc};
+    /// # use redis::AsyncConnectionConfig;
+    /// let messages = Arc::new(Mutex::new(Vec::new()));
+    /// let config = AsyncConnectionConfig::new().set_push_sender(move |msg|{
+    ///     let Ok(mut messages) = messages.lock() else {
+    ///         return Err(redis::aio::SendError);
+    ///     };
+    ///     messages.push(msg);
+    ///     Ok(())
+    /// });
+    /// ```
+    pub fn set_push_sender(self, sender: impl AsyncPushSender) -> Self {
+        self.set_push_sender_internal(std::sync::Arc::new(sender))
+    }
+
+    pub(crate) fn set_push_sender_internal(
+        mut self,
+        sender: std::sync::Arc<dyn AsyncPushSender>,
+    ) -> Self {
+        self.push_sender = Some(sender);
+        self
+    }
 }
 
 /// To enable async support you need to chose one of the supported runtimes and active its
@@ -71,6 +231,10 @@ impl Client {
 impl Client {
     /// Returns an async connection from the client.
     #[cfg(any(feature = "tokio-comp", feature = "async-std-comp"))]
+    #[deprecated(
+        note = "aio::Connection is deprecated. Use client::get_multiplexed_async_connection instead."
+    )]
+    #[allow(deprecated)]
     pub async fn get_async_connection(&self) -> RedisResult<crate::aio::Connection> {
         let con = match Runtime::locate() {
             #[cfg(feature = "tokio-comp")]
@@ -91,6 +255,10 @@ impl Client {
     /// Returns an async connection from the client.
     #[cfg(feature = "tokio-comp")]
     #[cfg_attr(docsrs, doc(cfg(feature = "tokio-comp")))]
+    #[deprecated(
+        note = "aio::Connection is deprecated. Use client::get_multiplexed_async_connection instead."
+    )]
+    #[allow(deprecated)]
     pub async fn get_tokio_connection(&self) -> RedisResult<crate::aio::Connection> {
         use crate::aio::RedisRuntime;
         Ok(
@@ -103,6 +271,10 @@ impl Client {
     /// Returns an async connection from the client.
     #[cfg(feature = "async-std-comp")]
     #[cfg_attr(docsrs, doc(cfg(feature = "async-std-comp")))]
+    #[deprecated(
+        note = "aio::Connection is deprecated. Use client::get_multiplexed_async_std_connection instead."
+    )]
+    #[allow(deprecated)]
     pub async fn get_async_std_connection(&self) -> RedisResult<crate::aio::Connection> {
         use crate::aio::RedisRuntime;
         Ok(
@@ -121,44 +293,193 @@ impl Client {
     pub async fn get_multiplexed_async_connection(
         &self,
     ) -> RedisResult<crate::aio::MultiplexedConnection> {
-        match Runtime::locate() {
+        self.get_multiplexed_async_connection_with_config(&AsyncConnectionConfig::new())
+            .await
+    }
+
+    /// Returns an async connection from the client.
+    #[cfg(any(feature = "tokio-comp", feature = "async-std-comp"))]
+    #[cfg_attr(
+        docsrs,
+        doc(cfg(any(feature = "tokio-comp", feature = "async-std-comp")))
+    )]
+    #[deprecated(note = "Use `get_multiplexed_async_connection_with_config` instead")]
+    pub async fn get_multiplexed_async_connection_with_timeouts(
+        &self,
+        response_timeout: std::time::Duration,
+        connection_timeout: std::time::Duration,
+    ) -> RedisResult<crate::aio::MultiplexedConnection> {
+        self.get_multiplexed_async_connection_with_config(
+            &AsyncConnectionConfig::new()
+                .set_connection_timeout(connection_timeout)
+                .set_response_timeout(response_timeout),
+        )
+        .await
+    }
+
+    /// Returns an async connection from the client.
+    #[cfg(any(feature = "tokio-comp", feature = "async-std-comp"))]
+    #[cfg_attr(
+        docsrs,
+        doc(cfg(any(feature = "tokio-comp", feature = "async-std-comp")))
+    )]
+    pub async fn get_multiplexed_async_connection_with_config(
+        &self,
+        config: &AsyncConnectionConfig,
+    ) -> RedisResult<crate::aio::MultiplexedConnection> {
+        let result = match Runtime::locate() {
             #[cfg(feature = "tokio-comp")]
-            Runtime::Tokio => self.get_multiplexed_tokio_connection().await,
+            rt @ Runtime::Tokio => {
+                if let Some(connection_timeout) = config.connection_timeout {
+                    rt.timeout(
+                        connection_timeout,
+                        self.get_multiplexed_async_connection_inner::<crate::aio::tokio::Tokio>(
+                            config,
+                        ),
+                    )
+                    .await
+                } else {
+                    Ok(self
+                        .get_multiplexed_async_connection_inner::<crate::aio::tokio::Tokio>(config)
+                        .await)
+                }
+            }
             #[cfg(feature = "async-std-comp")]
-            Runtime::AsyncStd => self.get_multiplexed_async_std_connection().await,
+            rt @ Runtime::AsyncStd => {
+                if let Some(connection_timeout) = config.connection_timeout {
+                    rt.timeout(
+                        connection_timeout,
+                        self.get_multiplexed_async_connection_inner::<crate::aio::async_std::AsyncStd>(
+                            config,
+                        ),
+                    )
+                    .await
+                } else {
+                    Ok(self
+                        .get_multiplexed_async_connection_inner::<crate::aio::async_std::AsyncStd>(
+                            config,
+                        )
+                        .await)
+                }
+            }
+        };
+
+        match result {
+            Ok(Ok(connection)) => Ok(connection),
+            Ok(Err(e)) => Err(e),
+            Err(elapsed) => Err(elapsed.into()),
         }
     }
 
     /// Returns an async multiplexed connection from the client.
     ///
-    /// A multiplexed connection can be cloned, allowing requests to be be sent concurrently
+    /// A multiplexed connection can be cloned, allowing requests to be sent concurrently
+    /// on the same underlying connection (tcp/unix socket).
+    #[cfg(feature = "tokio-comp")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "tokio-comp")))]
+    pub async fn get_multiplexed_tokio_connection_with_response_timeouts(
+        &self,
+        response_timeout: std::time::Duration,
+        connection_timeout: std::time::Duration,
+    ) -> RedisResult<crate::aio::MultiplexedConnection> {
+        let result = Runtime::locate()
+            .timeout(
+                connection_timeout,
+                self.get_multiplexed_async_connection_inner::<crate::aio::tokio::Tokio>(
+                    &AsyncConnectionConfig::new().set_response_timeout(response_timeout),
+                ),
+            )
+            .await;
+
+        match result {
+            Ok(Ok(connection)) => Ok(connection),
+            Ok(Err(e)) => Err(e),
+            Err(elapsed) => Err(elapsed.into()),
+        }
+    }
+
+    /// Returns an async multiplexed connection from the client.
+    ///
+    /// A multiplexed connection can be cloned, allowing requests to be sent concurrently
     /// on the same underlying connection (tcp/unix socket).
     #[cfg(feature = "tokio-comp")]
     #[cfg_attr(docsrs, doc(cfg(feature = "tokio-comp")))]
     pub async fn get_multiplexed_tokio_connection(
         &self,
     ) -> RedisResult<crate::aio::MultiplexedConnection> {
-        self.get_multiplexed_async_connection_inner::<crate::aio::tokio::Tokio>()
-            .await
+        self.get_multiplexed_async_connection_inner::<crate::aio::tokio::Tokio>(
+            &AsyncConnectionConfig::new(),
+        )
+        .await
     }
 
     /// Returns an async multiplexed connection from the client.
     ///
-    /// A multiplexed connection can be cloned, allowing requests to be be sent concurrently
+    /// A multiplexed connection can be cloned, allowing requests to be sent concurrently
+    /// on the same underlying connection (tcp/unix socket).
+    #[cfg(feature = "async-std-comp")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "async-std-comp")))]
+    pub async fn get_multiplexed_async_std_connection_with_timeouts(
+        &self,
+        response_timeout: std::time::Duration,
+        connection_timeout: std::time::Duration,
+    ) -> RedisResult<crate::aio::MultiplexedConnection> {
+        let result = Runtime::locate()
+            .timeout(
+                connection_timeout,
+                self.get_multiplexed_async_connection_inner::<crate::aio::async_std::AsyncStd>(
+                    &AsyncConnectionConfig::new().set_response_timeout(response_timeout),
+                ),
+            )
+            .await;
+
+        match result {
+            Ok(Ok(connection)) => Ok(connection),
+            Ok(Err(e)) => Err(e),
+            Err(elapsed) => Err(elapsed.into()),
+        }
+    }
+
+    /// Returns an async multiplexed connection from the client.
+    ///
+    /// A multiplexed connection can be cloned, allowing requests to be sent concurrently
     /// on the same underlying connection (tcp/unix socket).
     #[cfg(feature = "async-std-comp")]
     #[cfg_attr(docsrs, doc(cfg(feature = "async-std-comp")))]
     pub async fn get_multiplexed_async_std_connection(
         &self,
     ) -> RedisResult<crate::aio::MultiplexedConnection> {
-        self.get_multiplexed_async_connection_inner::<crate::aio::async_std::AsyncStd>()
-            .await
+        self.get_multiplexed_async_connection_inner::<crate::aio::async_std::AsyncStd>(
+            &AsyncConnectionConfig::new(),
+        )
+        .await
     }
 
     /// Returns an async multiplexed connection from the client and a future which must be polled
-    /// to drive any requests submitted to it (see `get_multiplexed_tokio_connection`).
+    /// to drive any requests submitted to it (see [Self::get_multiplexed_async_connection]).
     ///
-    /// A multiplexed connection can be cloned, allowing requests to be be sent concurrently
+    /// A multiplexed connection can be cloned, allowing requests to be sent concurrently
+    /// on the same underlying connection (tcp/unix socket).
+    /// The multiplexer will return a timeout error on any request that takes longer then `response_timeout`.
+    #[cfg(feature = "tokio-comp")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "tokio-comp")))]
+    pub async fn create_multiplexed_tokio_connection_with_response_timeout(
+        &self,
+        response_timeout: std::time::Duration,
+    ) -> RedisResult<(
+        crate::aio::MultiplexedConnection,
+        impl std::future::Future<Output = ()>,
+    )> {
+        self.create_multiplexed_async_connection_inner::<crate::aio::tokio::Tokio>(
+            &AsyncConnectionConfig::new().set_response_timeout(response_timeout),
+        )
+        .await
+    }
+
+    /// Returns an async multiplexed connection from the client and a future which must be polled
+    /// to drive any requests submitted to it (see [Self::get_multiplexed_async_connection]).
+    ///
+    /// A multiplexed connection can be cloned, allowing requests to be sent concurrently
     /// on the same underlying connection (tcp/unix socket).
     #[cfg(feature = "tokio-comp")]
     #[cfg_attr(docsrs, doc(cfg(feature = "tokio-comp")))]
@@ -168,14 +489,37 @@ impl Client {
         crate::aio::MultiplexedConnection,
         impl std::future::Future<Output = ()>,
     )> {
-        self.create_multiplexed_async_connection_inner::<crate::aio::tokio::Tokio>()
-            .await
+        self.create_multiplexed_async_connection_inner::<crate::aio::tokio::Tokio>(
+            &AsyncConnectionConfig::new(),
+        )
+        .await
     }
 
     /// Returns an async multiplexed connection from the client and a future which must be polled
-    /// to drive any requests submitted to it (see `get_multiplexed_tokio_connection`).
+    /// to drive any requests submitted to it (see [Self::get_multiplexed_async_connection]).
     ///
-    /// A multiplexed connection can be cloned, allowing requests to be be sent concurrently
+    /// A multiplexed connection can be cloned, allowing requests to be sent concurrently
+    /// on the same underlying connection (tcp/unix socket).
+    /// The multiplexer will return a timeout error on any request that takes longer then `response_timeout`.
+    #[cfg(feature = "async-std-comp")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "async-std-comp")))]
+    pub async fn create_multiplexed_async_std_connection_with_response_timeout(
+        &self,
+        response_timeout: std::time::Duration,
+    ) -> RedisResult<(
+        crate::aio::MultiplexedConnection,
+        impl std::future::Future<Output = ()>,
+    )> {
+        self.create_multiplexed_async_connection_inner::<crate::aio::async_std::AsyncStd>(
+            &AsyncConnectionConfig::new().set_response_timeout(response_timeout),
+        )
+        .await
+    }
+
+    /// Returns an async multiplexed connection from the client and a future which must be polled
+    /// to drive any requests submitted to it (see [Self::get_multiplexed_async_connection]).
+    ///
+    /// A multiplexed connection can be cloned, allowing requests to be sent concurrently
     /// on the same underlying connection (tcp/unix socket).
     #[cfg(feature = "async-std-comp")]
     #[cfg_attr(docsrs, doc(cfg(feature = "async-std-comp")))]
@@ -185,8 +529,196 @@ impl Client {
         crate::aio::MultiplexedConnection,
         impl std::future::Future<Output = ()>,
     )> {
-        self.create_multiplexed_async_connection_inner::<crate::aio::async_std::AsyncStd>()
-            .await
+        self.create_multiplexed_async_connection_inner::<crate::aio::async_std::AsyncStd>(
+            &AsyncConnectionConfig::new(),
+        )
+        .await
+    }
+
+    /// Returns an async [`ConnectionManager`][connection-manager] from the client.
+    ///
+    /// The connection manager wraps a
+    /// [`MultiplexedConnection`][multiplexed-connection]. If a command to that
+    /// connection fails with a connection error, then a new connection is
+    /// established in the background and the error is returned to the caller.
+    ///
+    /// This means that on connection loss at least one command will fail, but
+    /// the connection will be re-established automatically if possible. Please
+    /// refer to the [`ConnectionManager`][connection-manager] docs for
+    /// detailed reconnecting behavior.
+    ///
+    /// A connection manager can be cloned, allowing requests to be sent concurrently
+    /// on the same underlying connection (tcp/unix socket).
+    ///
+    /// [connection-manager]: aio/struct.ConnectionManager.html
+    /// [multiplexed-connection]: aio/struct.MultiplexedConnection.html
+    #[cfg(feature = "connection-manager")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "connection-manager")))]
+    #[deprecated(note = "use get_connection_manager instead")]
+    pub async fn get_tokio_connection_manager(&self) -> RedisResult<crate::aio::ConnectionManager> {
+        crate::aio::ConnectionManager::new(self.clone()).await
+    }
+
+    /// Returns an async [`ConnectionManager`][connection-manager] from the client.
+    ///
+    /// The connection manager wraps a
+    /// [`MultiplexedConnection`][multiplexed-connection]. If a command to that
+    /// connection fails with a connection error, then a new connection is
+    /// established in the background and the error is returned to the caller.
+    ///
+    /// This means that on connection loss at least one command will fail, but
+    /// the connection will be re-established automatically if possible. Please
+    /// refer to the [`ConnectionManager`][connection-manager] docs for
+    /// detailed reconnecting behavior.
+    ///
+    /// A connection manager can be cloned, allowing requests to be sent concurrently
+    /// on the same underlying connection (tcp/unix socket).
+    ///
+    /// [connection-manager]: aio/struct.ConnectionManager.html
+    /// [multiplexed-connection]: aio/struct.MultiplexedConnection.html
+    #[cfg(feature = "connection-manager")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "connection-manager")))]
+    pub async fn get_connection_manager(&self) -> RedisResult<crate::aio::ConnectionManager> {
+        crate::aio::ConnectionManager::new(self.clone()).await
+    }
+
+    /// Returns an async [`ConnectionManager`][connection-manager] from the client.
+    ///
+    /// The connection manager wraps a
+    /// [`MultiplexedConnection`][multiplexed-connection]. If a command to that
+    /// connection fails with a connection error, then a new connection is
+    /// established in the background and the error is returned to the caller.
+    ///
+    /// This means that on connection loss at least one command will fail, but
+    /// the connection will be re-established automatically if possible. Please
+    /// refer to the [`ConnectionManager`][connection-manager] docs for
+    /// detailed reconnecting behavior.
+    ///
+    /// A connection manager can be cloned, allowing requests to be sent concurrently
+    /// on the same underlying connection (tcp/unix socket).
+    ///
+    /// [connection-manager]: aio/struct.ConnectionManager.html
+    /// [multiplexed-connection]: aio/struct.MultiplexedConnection.html
+    #[cfg(feature = "connection-manager")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "connection-manager")))]
+    #[deprecated(note = "Use `get_connection_manager_with_config` instead")]
+    pub async fn get_tokio_connection_manager_with_backoff(
+        &self,
+        exponent_base: u64,
+        factor: u64,
+        number_of_retries: usize,
+    ) -> RedisResult<crate::aio::ConnectionManager> {
+        use crate::aio::ConnectionManagerConfig;
+
+        let config = ConnectionManagerConfig::new()
+            .set_exponent_base(exponent_base)
+            .set_factor(factor)
+            .set_number_of_retries(number_of_retries);
+        crate::aio::ConnectionManager::new_with_config(self.clone(), config).await
+    }
+
+    /// Returns an async [`ConnectionManager`][connection-manager] from the client.
+    ///
+    /// The connection manager wraps a
+    /// [`MultiplexedConnection`][multiplexed-connection]. If a command to that
+    /// connection fails with a connection error, then a new connection is
+    /// established in the background and the error is returned to the caller.
+    ///
+    /// This means that on connection loss at least one command will fail, but
+    /// the connection will be re-established automatically if possible. Please
+    /// refer to the [`ConnectionManager`][connection-manager] docs for
+    /// detailed reconnecting behavior.
+    ///
+    /// A connection manager can be cloned, allowing requests to be sent concurrently
+    /// on the same underlying connection (tcp/unix socket).
+    ///
+    /// [connection-manager]: aio/struct.ConnectionManager.html
+    /// [multiplexed-connection]: aio/struct.MultiplexedConnection.html
+    #[cfg(feature = "connection-manager")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "connection-manager")))]
+    #[deprecated(note = "Use `get_connection_manager_with_config` instead")]
+    pub async fn get_tokio_connection_manager_with_backoff_and_timeouts(
+        &self,
+        exponent_base: u64,
+        factor: u64,
+        number_of_retries: usize,
+        response_timeout: std::time::Duration,
+        connection_timeout: std::time::Duration,
+    ) -> RedisResult<crate::aio::ConnectionManager> {
+        use crate::aio::ConnectionManagerConfig;
+
+        let config = ConnectionManagerConfig::new()
+            .set_exponent_base(exponent_base)
+            .set_factor(factor)
+            .set_response_timeout(response_timeout)
+            .set_connection_timeout(connection_timeout)
+            .set_number_of_retries(number_of_retries);
+        crate::aio::ConnectionManager::new_with_config(self.clone(), config).await
+    }
+
+    /// Returns an async [`ConnectionManager`][connection-manager] from the client.
+    ///
+    /// The connection manager wraps a
+    /// [`MultiplexedConnection`][multiplexed-connection]. If a command to that
+    /// connection fails with a connection error, then a new connection is
+    /// established in the background and the error is returned to the caller.
+    ///
+    /// This means that on connection loss at least one command will fail, but
+    /// the connection will be re-established automatically if possible. Please
+    /// refer to the [`ConnectionManager`][connection-manager] docs for
+    /// detailed reconnecting behavior.
+    ///
+    /// A connection manager can be cloned, allowing requests to be sent concurrently
+    /// on the same underlying connection (tcp/unix socket).
+    ///
+    /// [connection-manager]: aio/struct.ConnectionManager.html
+    /// [multiplexed-connection]: aio/struct.MultiplexedConnection.html
+    #[cfg(feature = "connection-manager")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "connection-manager")))]
+    #[deprecated(note = "Use `get_connection_manager_with_config` instead")]
+    pub async fn get_connection_manager_with_backoff_and_timeouts(
+        &self,
+        exponent_base: u64,
+        factor: u64,
+        number_of_retries: usize,
+        response_timeout: std::time::Duration,
+        connection_timeout: std::time::Duration,
+    ) -> RedisResult<crate::aio::ConnectionManager> {
+        use crate::aio::ConnectionManagerConfig;
+
+        let config = ConnectionManagerConfig::new()
+            .set_exponent_base(exponent_base)
+            .set_factor(factor)
+            .set_response_timeout(response_timeout)
+            .set_connection_timeout(connection_timeout)
+            .set_number_of_retries(number_of_retries);
+        crate::aio::ConnectionManager::new_with_config(self.clone(), config).await
+    }
+
+    /// Returns an async [`ConnectionManager`][connection-manager] from the client.
+    ///
+    /// The connection manager wraps a
+    /// [`MultiplexedConnection`][multiplexed-connection]. If a command to that
+    /// connection fails with a connection error, then a new connection is
+    /// established in the background and the error is returned to the caller.
+    ///
+    /// This means that on connection loss at least one command will fail, but
+    /// the connection will be re-established automatically if possible. Please
+    /// refer to the [`ConnectionManager`][connection-manager] docs for
+    /// detailed reconnecting behavior.
+    ///
+    /// A connection manager can be cloned, allowing requests to be sent concurrently
+    /// on the same underlying connection (tcp/unix socket).
+    ///
+    /// [connection-manager]: aio/struct.ConnectionManager.html
+    /// [multiplexed-connection]: aio/struct.MultiplexedConnection.html
+    #[cfg(feature = "connection-manager")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "connection-manager")))]
+    pub async fn get_connection_manager_with_config(
+        &self,
+        config: crate::aio::ConnectionManagerConfig,
+    ) -> RedisResult<crate::aio::ConnectionManager> {
+        crate::aio::ConnectionManager::new_with_config(self.clone(), config).await
     }
 
     /// Returns an async [`ConnectionManager`][connection-manager] from the client.
@@ -208,25 +740,40 @@ impl Client {
     /// [multiplexed-connection]: aio/struct.MultiplexedConnection.html
     #[cfg(feature = "connection-manager")]
     #[cfg_attr(docsrs, doc(cfg(feature = "connection-manager")))]
-    pub async fn get_tokio_connection_manager(&self) -> RedisResult<crate::aio::ConnectionManager> {
-        crate::aio::ConnectionManager::new(self.clone()).await
+    #[deprecated(note = "Use `get_connection_manager_with_config` instead")]
+    pub async fn get_connection_manager_with_backoff(
+        &self,
+        exponent_base: u64,
+        factor: u64,
+        number_of_retries: usize,
+    ) -> RedisResult<crate::aio::ConnectionManager> {
+        use crate::aio::ConnectionManagerConfig;
+
+        let config = ConnectionManagerConfig::new()
+            .set_exponent_base(exponent_base)
+            .set_factor(factor)
+            .set_number_of_retries(number_of_retries);
+        crate::aio::ConnectionManager::new_with_config(self.clone(), config).await
     }
 
     async fn get_multiplexed_async_connection_inner<T>(
         &self,
+        config: &AsyncConnectionConfig,
     ) -> RedisResult<crate::aio::MultiplexedConnection>
     where
         T: crate::aio::RedisRuntime,
     {
-        let (connection, driver) = self
-            .create_multiplexed_async_connection_inner::<T>()
+        let (mut connection, driver) = self
+            .create_multiplexed_async_connection_inner::<T>(config)
             .await?;
-        T::spawn(driver);
+        let handle = T::spawn(driver);
+        connection.set_task_handle(handle);
         Ok(connection)
     }
 
     async fn create_multiplexed_async_connection_inner<T>(
         &self,
+        config: &AsyncConnectionConfig,
     ) -> RedisResult<(
         crate::aio::MultiplexedConnection,
         impl std::future::Future<Output = ()>,
@@ -235,7 +782,12 @@ impl Client {
         T: crate::aio::RedisRuntime,
     {
         let con = self.get_simple_async_connection::<T>().await?;
-        crate::aio::MultiplexedConnection::new(&self.connection_info.redis, con).await
+        crate::aio::MultiplexedConnection::new_with_config(
+            &self.connection_info.redis,
+            con,
+            config.clone(),
+        )
+        .await
     }
 
     async fn get_simple_async_connection<T>(
@@ -252,6 +804,37 @@ impl Client {
     #[cfg(feature = "connection-manager")]
     pub(crate) fn connection_info(&self) -> &ConnectionInfo {
         &self.connection_info
+    }
+
+    /// Returns an async receiver for pub-sub messages.
+    #[cfg(any(feature = "tokio-comp", feature = "async-std-comp"))]
+    // TODO - do we want to type-erase pubsub using a trait, to allow us to replace it with a different implementation later?
+    pub async fn get_async_pubsub(&self) -> RedisResult<crate::aio::PubSub> {
+        let connection = match Runtime::locate() {
+            #[cfg(feature = "tokio-comp")]
+            Runtime::Tokio => {
+                self.get_simple_async_connection::<crate::aio::tokio::Tokio>()
+                    .await?
+            }
+
+            #[cfg(feature = "async-std-comp")]
+            Runtime::AsyncStd => {
+                self.get_simple_async_connection::<crate::aio::async_std::AsyncStd>()
+                    .await?
+            }
+        };
+
+        crate::aio::PubSub::new(&self.connection_info.redis, connection).await
+    }
+
+    /// Returns an async receiver for monitor messages.
+    #[cfg(any(feature = "tokio-comp", feature = "async-std-comp"))]
+    // TODO - do we want to type-erase monitor using a trait, to allow us to replace it with a different implementation later?
+    pub async fn get_async_monitor(&self) -> RedisResult<crate::aio::Monitor> {
+        #[allow(deprecated)]
+        self.get_async_connection()
+            .await
+            .map(|connection| connection.into_monitor())
     }
 }
 

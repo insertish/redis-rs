@@ -6,6 +6,16 @@ use crate::{
 
 use std::io::{Error, ErrorKind};
 
+macro_rules! invalid_type_error {
+    ($v:expr, $det:expr) => {{
+        fail!((
+            $crate::ErrorKind::TypeError,
+            "Response was of incompatible type",
+            format!("{:?} (response was {:?})", $det, $v)
+        ));
+    }};
+}
+
 // Stream Maxlen Enum
 
 /// Utility enum for passing `MAXLEN [= or ~] [COUNT]`
@@ -34,6 +44,203 @@ impl ToRedisArgs for StreamMaxlen {
     }
 }
 
+/// Utility enum for passing the trim mode`[=|~]`
+/// arguments into `StreamCommands`.
+#[derive(Debug)]
+pub enum StreamTrimmingMode {
+    /// Match an exact count
+    Exact,
+    /// Match an approximate count
+    Approx,
+}
+
+impl ToRedisArgs for StreamTrimmingMode {
+    fn write_redis_args<W>(&self, out: &mut W)
+    where
+        W: ?Sized + RedisWrite,
+    {
+        match self {
+            Self::Exact => out.write_arg(b"="),
+            Self::Approx => out.write_arg(b"~"),
+        };
+    }
+}
+
+/// Utility enum for passing `<MAXLEN|MINID> [=|~] threshold [LIMIT count]`
+/// arguments into `StreamCommands`.
+/// The enum values the trimming mode (=|~), the threshold, and the optional limit
+#[derive(Debug)]
+pub enum StreamTrimStrategy {
+    /// Evicts entries as long as the streams length exceeds threshold.  With an optional limit.
+    MaxLen(StreamTrimmingMode, usize, Option<usize>),
+    /// Evicts entries with IDs lower than threshold, where threshold is a stream ID With an optional limit.
+    MinId(StreamTrimmingMode, String, Option<usize>),
+}
+
+impl StreamTrimStrategy {
+    /// Define a MAXLEN trim strategy with the given maximum number of entries
+    pub fn maxlen(trim: StreamTrimmingMode, max_entries: usize) -> Self {
+        Self::MaxLen(trim, max_entries, None)
+    }
+
+    /// Defines a MINID trim strategy with the given minimum stream ID
+    pub fn minid(trim: StreamTrimmingMode, stream_id: impl Into<String>) -> Self {
+        Self::MinId(trim, stream_id.into(), None)
+    }
+
+    /// Set a limit to the number of records to trim in a single operation
+    pub fn limit(self, limit: usize) -> Self {
+        match self {
+            StreamTrimStrategy::MaxLen(m, t, _) => StreamTrimStrategy::MaxLen(m, t, Some(limit)),
+            StreamTrimStrategy::MinId(m, t, _) => StreamTrimStrategy::MinId(m, t, Some(limit)),
+        }
+    }
+}
+
+impl ToRedisArgs for StreamTrimStrategy {
+    fn write_redis_args<W>(&self, out: &mut W)
+    where
+        W: ?Sized + RedisWrite,
+    {
+        let limit = match self {
+            StreamTrimStrategy::MaxLen(m, t, limit) => {
+                out.write_arg(b"MAXLEN");
+                m.write_redis_args(out);
+                t.write_redis_args(out);
+                limit
+            }
+            StreamTrimStrategy::MinId(m, t, limit) => {
+                out.write_arg(b"MINID");
+                m.write_redis_args(out);
+                t.write_redis_args(out);
+                limit
+            }
+        };
+        if let Some(limit) = limit {
+            out.write_arg(b"LIMIT");
+            limit.write_redis_args(out);
+        }
+    }
+}
+
+/// Builder options for [`xtrim_options`] command
+///
+/// [`xtrim_options`]: ../trait.Commands.html#method.xtrim_options
+///
+#[derive(Debug)]
+pub struct StreamTrimOptions {
+    strategy: StreamTrimStrategy,
+}
+
+impl StreamTrimOptions {
+    /// Define a MAXLEN trim strategy with the given maximum number of entries
+    pub fn maxlen(mode: StreamTrimmingMode, max_entries: usize) -> Self {
+        Self {
+            strategy: StreamTrimStrategy::maxlen(mode, max_entries),
+        }
+    }
+
+    /// Defines a MINID trim strategy with the given minimum stream ID
+    pub fn minid(mode: StreamTrimmingMode, stream_id: impl Into<String>) -> Self {
+        Self {
+            strategy: StreamTrimStrategy::minid(mode, stream_id),
+        }
+    }
+
+    /// Set a limit to the number of records to trim in a single operation
+    pub fn limit(mut self, limit: usize) -> Self {
+        self.strategy = self.strategy.limit(limit);
+        self
+    }
+}
+
+impl ToRedisArgs for StreamTrimOptions {
+    fn write_redis_args<W>(&self, out: &mut W)
+    where
+        W: ?Sized + RedisWrite,
+    {
+        self.strategy.write_redis_args(out);
+    }
+}
+
+/// Builder options for [`xadd_options`] command
+///
+/// [`xadd_options`]: ../trait.Commands.html#method.xadd_options
+///
+#[derive(Default, Debug)]
+pub struct StreamAddOptions {
+    nomkstream: bool,
+    trim: Option<StreamTrimStrategy>,
+}
+
+impl StreamAddOptions {
+    /// Set the NOMKSTREAM flag on which prevents creating a stream for the XADD operation
+    pub fn nomkstream(mut self) -> Self {
+        self.nomkstream = true;
+        self
+    }
+
+    /// Enable trimming when adding using the given trim strategy
+    pub fn trim(mut self, trim: StreamTrimStrategy) -> Self {
+        self.trim = Some(trim);
+        self
+    }
+}
+
+impl ToRedisArgs for StreamAddOptions {
+    fn write_redis_args<W>(&self, out: &mut W)
+    where
+        W: ?Sized + RedisWrite,
+    {
+        if self.nomkstream {
+            out.write_arg(b"NOMKSTREAM");
+        }
+        if let Some(strategy) = self.trim.as_ref() {
+            strategy.write_redis_args(out);
+        }
+    }
+}
+
+/// Builder options for [`xautoclaim_options`] command.
+///
+/// [`xautoclaim_options`]: ../trait.Commands.html#method.xautoclaim_options
+///
+#[derive(Default, Debug)]
+pub struct StreamAutoClaimOptions {
+    count: Option<usize>,
+    justid: bool,
+}
+
+impl StreamAutoClaimOptions {
+    /// Sets the maximum number of elements to claim per stream.
+    pub fn count(mut self, n: usize) -> Self {
+        self.count = Some(n);
+        self
+    }
+
+    /// Set `JUSTID` cmd arg to true. Be advised: the response
+    /// type changes with this option.
+    pub fn with_justid(mut self) -> Self {
+        self.justid = true;
+        self
+    }
+}
+
+impl ToRedisArgs for StreamAutoClaimOptions {
+    fn write_redis_args<W>(&self, out: &mut W)
+    where
+        W: ?Sized + RedisWrite,
+    {
+        if let Some(ref count) = self.count {
+            out.write_arg(b"COUNT");
+            out.write_arg(format!("{count}").as_bytes());
+        }
+        if self.justid {
+            out.write_arg(b"JUSTID");
+        }
+    }
+}
+
 /// Builder options for [`xclaim_options`] command.
 ///
 /// [`xclaim_options`]: ../trait.Commands.html#method.xclaim_options
@@ -51,6 +258,8 @@ pub struct StreamClaimOptions {
     /// Set `JUSTID` cmd arg. Be advised: the response
     /// type changes with this option.
     justid: bool,
+    /// Set `LASTID <lastid>` cmd arg.
+    lastid: Option<String>,
 }
 
 impl StreamClaimOptions {
@@ -84,6 +293,12 @@ impl StreamClaimOptions {
         self.justid = true;
         self
     }
+
+    /// Set `LASTID <lastid>` cmd arg.
+    pub fn with_lastid(mut self, lastid: impl Into<String>) -> Self {
+        self.lastid = Some(lastid.into());
+        self
+    }
 }
 
 impl ToRedisArgs for StreamClaimOptions {
@@ -108,6 +323,10 @@ impl ToRedisArgs for StreamClaimOptions {
         }
         if self.justid {
             out.write_arg(b"JUSTID");
+        }
+        if let Some(ref lastid) = self.lastid {
+            out.write_arg(b"LASTID");
+            lastid.write_redis_args(out);
         }
     }
 }
@@ -179,6 +398,16 @@ impl ToRedisArgs for StreamReadOptions {
     where
         W: ?Sized + RedisWrite,
     {
+        if let Some(ref group) = self.group {
+            out.write_arg(b"GROUP");
+            for i in &group.0 {
+                out.write_arg(i);
+            }
+            for i in &group.1 {
+                out.write_arg(i);
+            }
+        }
+
         if let Some(ref ms) = self.block {
             out.write_arg(b"BLOCK");
             out.write_arg(format!("{ms}").as_bytes());
@@ -189,21 +418,27 @@ impl ToRedisArgs for StreamReadOptions {
             out.write_arg(format!("{n}").as_bytes());
         }
 
-        if let Some(ref group) = self.group {
+        if self.group.is_some() {
             // noack is only available w/ xreadgroup
             if self.noack == Some(true) {
                 out.write_arg(b"NOACK");
             }
-
-            out.write_arg(b"GROUP");
-            for i in &group.0 {
-                out.write_arg(i);
-            }
-            for i in &group.1 {
-                out.write_arg(i);
-            }
         }
     }
+}
+
+/// Reply type used with the [`xautoclaim_options`] command.
+///
+/// [`xautoclaim_options`]: ../trait.Commands.html#method.xautoclaim_options
+///
+#[derive(Default, Debug, Clone)]
+pub struct StreamAutoClaimReply {
+    /// The next stream id to use as the start argument for the next xautoclaim
+    pub next_stream_id: String,
+    /// The entries claimed for the consumer. When JUSTID is enabled the map in each entry is blank
+    pub claimed: Vec<StreamId>,
+    /// The list of stream ids that were removed due to no longer being in the stream
+    pub deleted_ids: Vec<String>,
 }
 
 /// Reply type used with [`xread`] or [`xread_options`] commands.
@@ -253,18 +488,13 @@ pub struct StreamClaimReply {
 ///
 /// [`xpending`]: ../trait.Commands.html#method.xpending
 ///
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub enum StreamPendingReply {
     /// The stream is empty.
+    #[default]
     Empty,
     /// Data with payload exists in the stream.
     Data(StreamPendingData),
-}
-
-impl Default for StreamPendingReply {
-    fn default() -> StreamPendingReply {
-        StreamPendingReply::Empty
-    }
 }
 
 impl StreamPendingReply {
@@ -389,6 +619,12 @@ pub struct StreamInfoGroup {
     pub pending: usize,
     /// Last ID delivered to this group.
     pub last_delivered_id: String,
+    /// The logical "read counter" of the last entry delivered to group's consumers
+    /// (or `None` if the server does not provide the value).
+    pub entries_read: Option<usize>,
+    /// The number of entries in the stream that are still waiting to be delivered to the
+    /// group's consumers, or a `None` when that number can't be determined.
+    pub lag: Option<usize>,
 }
 
 /// Represents a pending message parsed from [`xpending`] methods.
@@ -428,11 +664,11 @@ pub struct StreamId {
 }
 
 impl StreamId {
-    /// Converts a `Value::Bulk` into a `StreamId`.
-    fn from_bulk_value(v: &Value) -> RedisResult<Self> {
+    /// Converts a `Value::Array` into a `StreamId`.
+    fn from_array_value(v: &Value) -> RedisResult<Self> {
         let mut stream_id = StreamId::default();
-        if let Value::Bulk(ref values) = *v {
-            if let Some(v) = values.get(0) {
+        if let Value::Array(ref values) = *v {
+            if let Some(v) = values.first() {
                 stream_id.id = from_redis_value(v)?;
             }
             if let Some(v) = values.get(1) {
@@ -453,8 +689,8 @@ impl StreamId {
     }
 
     /// Does the message contain a particular field?
-    pub fn contains_key(&self, key: &&str) -> bool {
-        self.map.get(*key).is_some()
+    pub fn contains_key(&self, key: &str) -> bool {
+        self.map.contains_key(key)
     }
 
     /// Returns how many field/value pairs exist in this message.
@@ -465,6 +701,60 @@ impl StreamId {
     /// Returns true if there are no field/value pairs in this message.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+}
+
+type SACRows = Vec<HashMap<String, HashMap<String, Value>>>;
+
+impl FromRedisValue for StreamAutoClaimReply {
+    fn from_redis_value(v: &Value) -> RedisResult<Self> {
+        match *v {
+            Value::Array(ref items) => {
+                if let 2..=3 = items.len() {
+                    let deleted_ids = if let Some(o) = items.get(2) {
+                        from_redis_value(o)?
+                    } else {
+                        Vec::new()
+                    };
+
+                    let claimed: Vec<StreamId> = match &items[1] {
+                        // JUSTID response
+                        Value::Array(x)
+                            if matches!(x.first(), None | Some(Value::BulkString(_))) =>
+                        {
+                            let ids: Vec<String> = from_redis_value(&items[1])?;
+
+                            ids.into_iter()
+                                .map(|id| StreamId {
+                                    id,
+                                    ..Default::default()
+                                })
+                                .collect()
+                        }
+                        // full response
+                        Value::Array(x) if matches!(x.first(), Some(Value::Array(_))) => {
+                            let rows: SACRows = from_redis_value(&items[1])?;
+
+                            rows.into_iter()
+                                .flat_map(|id_row| {
+                                    id_row.into_iter().map(|(id, map)| StreamId { id, map })
+                                })
+                                .collect()
+                        }
+                        _ => invalid_type_error!("Incorrect type", &items[1]),
+                    };
+
+                    Ok(Self {
+                        next_stream_id: from_redis_value(&items[0])?,
+                        claimed,
+                        deleted_ids,
+                    })
+                } else {
+                    invalid_type_error!("Wrong number of entries in array response", v)
+                }
+            }
+            _ => invalid_type_error!("Not a array response", v),
+        }
     }
 }
 
@@ -562,11 +852,11 @@ impl FromRedisValue for StreamPendingCountReply {
     fn from_redis_value(v: &Value) -> RedisResult<Self> {
         let mut reply = StreamPendingCountReply::default();
         match v {
-            Value::Bulk(outer_tuple) => {
+            Value::Array(outer_tuple) => {
                 for outer in outer_tuple {
                     match outer {
-                        Value::Bulk(inner_tuple) => match &inner_tuple[..] {
-                            [Value::Data(id_bytes), Value::Data(consumer_bytes), Value::Int(last_delivered_ms_u64), Value::Int(times_delivered_u64)] =>
+                        Value::Array(inner_tuple) => match &inner_tuple[..] {
+                            [Value::BulkString(id_bytes), Value::BulkString(consumer_bytes), Value::Int(last_delivered_ms_u64), Value::Int(times_delivered_u64)] =>
                             {
                                 let id = String::from_utf8(id_bytes.to_vec())?;
                                 let consumer = String::from_utf8(consumer_bytes.to_vec())?;
@@ -617,10 +907,10 @@ impl FromRedisValue for StreamInfoStreamReply {
             reply.length = from_redis_value(v)?;
         }
         if let Some(v) = &map.get("first-entry") {
-            reply.first_entry = StreamId::from_bulk_value(v)?;
+            reply.first_entry = StreamId::from_array_value(v)?;
         }
         if let Some(v) = &map.get("last-entry") {
-            reply.last_entry = StreamId::from_bulk_value(v)?;
+            reply.last_entry = StreamId::from_array_value(v)?;
         }
         Ok(reply)
     }
@@ -666,8 +956,280 @@ impl FromRedisValue for StreamInfoGroupsReply {
             if let Some(v) = &map.get("last-delivered-id") {
                 g.last_delivered_id = from_redis_value(v)?;
             }
+            if let Some(v) = &map.get("entries-read") {
+                g.entries_read = if let Value::Nil = v {
+                    None
+                } else {
+                    Some(from_redis_value(v)?)
+                };
+            }
+            if let Some(v) = &map.get("lag") {
+                g.lag = if let Value::Nil = v {
+                    None
+                } else {
+                    Some(from_redis_value(v)?)
+                };
+            }
             reply.groups.push(g);
         }
         Ok(reply)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn assert_command_eq(object: impl ToRedisArgs, expected: &[u8]) {
+        let mut out: Vec<Vec<u8>> = Vec::new();
+
+        object.write_redis_args(&mut out);
+
+        let mut cmd: Vec<u8> = Vec::new();
+
+        out.iter_mut().for_each(|item| {
+            cmd.append(item);
+            cmd.push(b' ');
+        });
+
+        cmd.pop();
+
+        assert_eq!(cmd, expected);
+    }
+
+    mod stream_auto_claim_reply {
+        use super::*;
+        use crate::Value;
+
+        #[test]
+        fn short_response() {
+            let value = Value::Array(vec![Value::BulkString("1713465536578-0".into())]);
+
+            let reply: RedisResult<StreamAutoClaimReply> = FromRedisValue::from_redis_value(&value);
+
+            assert!(reply.is_err());
+        }
+
+        #[test]
+        fn parses_none_claimed_response() {
+            let value = Value::Array(vec![
+                Value::BulkString("0-0".into()),
+                Value::Array(vec![]),
+                Value::Array(vec![]),
+            ]);
+
+            let reply: RedisResult<StreamAutoClaimReply> = FromRedisValue::from_redis_value(&value);
+
+            assert!(reply.is_ok());
+
+            let reply = reply.unwrap();
+
+            assert_eq!(reply.next_stream_id.as_str(), "0-0");
+            assert_eq!(reply.claimed.len(), 0);
+            assert_eq!(reply.deleted_ids.len(), 0);
+        }
+
+        #[test]
+        fn parses_response() {
+            let value = Value::Array(vec![
+                Value::BulkString("1713465536578-0".into()),
+                Value::Array(vec![
+                    Value::Array(vec![
+                        Value::BulkString("1713465533411-0".into()),
+                        // Both RESP2 and RESP3 expose this map as an array of key/values
+                        Value::Array(vec![
+                            Value::BulkString("name".into()),
+                            Value::BulkString("test".into()),
+                            Value::BulkString("other".into()),
+                            Value::BulkString("whaterver".into()),
+                        ]),
+                    ]),
+                    Value::Array(vec![
+                        Value::BulkString("1713465536069-0".into()),
+                        Value::Array(vec![
+                            Value::BulkString("name".into()),
+                            Value::BulkString("another test".into()),
+                            Value::BulkString("other".into()),
+                            Value::BulkString("something".into()),
+                        ]),
+                    ]),
+                ]),
+                Value::Array(vec![Value::BulkString("123456789-0".into())]),
+            ]);
+
+            let reply: RedisResult<StreamAutoClaimReply> = FromRedisValue::from_redis_value(&value);
+
+            assert!(reply.is_ok());
+
+            let reply = reply.unwrap();
+
+            assert_eq!(reply.next_stream_id.as_str(), "1713465536578-0");
+            assert_eq!(reply.claimed.len(), 2);
+            assert_eq!(reply.claimed[0].id.as_str(), "1713465533411-0");
+            assert!(
+                matches!(reply.claimed[0].map.get("name"), Some(Value::BulkString(v)) if v == "test".as_bytes())
+            );
+            assert_eq!(reply.claimed[1].id.as_str(), "1713465536069-0");
+            assert_eq!(reply.deleted_ids.len(), 1);
+            assert!(reply.deleted_ids.contains(&"123456789-0".to_string()))
+        }
+
+        #[test]
+        fn parses_v6_response() {
+            let value = Value::Array(vec![
+                Value::BulkString("1713465536578-0".into()),
+                Value::Array(vec![
+                    Value::Array(vec![
+                        Value::BulkString("1713465533411-0".into()),
+                        Value::Array(vec![
+                            Value::BulkString("name".into()),
+                            Value::BulkString("test".into()),
+                            Value::BulkString("other".into()),
+                            Value::BulkString("whaterver".into()),
+                        ]),
+                    ]),
+                    Value::Array(vec![
+                        Value::BulkString("1713465536069-0".into()),
+                        Value::Array(vec![
+                            Value::BulkString("name".into()),
+                            Value::BulkString("another test".into()),
+                            Value::BulkString("other".into()),
+                            Value::BulkString("something".into()),
+                        ]),
+                    ]),
+                ]),
+                // V6 and lower lack the deleted_ids array
+            ]);
+
+            let reply: RedisResult<StreamAutoClaimReply> = FromRedisValue::from_redis_value(&value);
+
+            assert!(reply.is_ok());
+
+            let reply = reply.unwrap();
+
+            assert_eq!(reply.next_stream_id.as_str(), "1713465536578-0");
+            assert_eq!(reply.claimed.len(), 2);
+            let ids: Vec<_> = reply.claimed.iter().map(|e| e.id.as_str()).collect();
+            assert!(ids.contains(&"1713465533411-0"));
+            assert!(ids.contains(&"1713465536069-0"));
+            assert_eq!(reply.deleted_ids.len(), 0);
+        }
+
+        #[test]
+        fn parses_justid_response() {
+            let value = Value::Array(vec![
+                Value::BulkString("1713465536578-0".into()),
+                Value::Array(vec![
+                    Value::BulkString("1713465533411-0".into()),
+                    Value::BulkString("1713465536069-0".into()),
+                ]),
+                Value::Array(vec![Value::BulkString("123456789-0".into())]),
+            ]);
+
+            let reply: RedisResult<StreamAutoClaimReply> = FromRedisValue::from_redis_value(&value);
+
+            assert!(reply.is_ok());
+
+            let reply = reply.unwrap();
+
+            assert_eq!(reply.next_stream_id.as_str(), "1713465536578-0");
+            assert_eq!(reply.claimed.len(), 2);
+            let ids: Vec<_> = reply.claimed.iter().map(|e| e.id.as_str()).collect();
+            assert!(ids.contains(&"1713465533411-0"));
+            assert!(ids.contains(&"1713465536069-0"));
+            assert_eq!(reply.deleted_ids.len(), 1);
+            assert!(reply.deleted_ids.contains(&"123456789-0".to_string()))
+        }
+
+        #[test]
+        fn parses_v6_justid_response() {
+            let value = Value::Array(vec![
+                Value::BulkString("1713465536578-0".into()),
+                Value::Array(vec![
+                    Value::BulkString("1713465533411-0".into()),
+                    Value::BulkString("1713465536069-0".into()),
+                ]),
+                // V6 and lower lack the deleted_ids array
+            ]);
+
+            let reply: RedisResult<StreamAutoClaimReply> = FromRedisValue::from_redis_value(&value);
+
+            assert!(reply.is_ok());
+
+            let reply = reply.unwrap();
+
+            assert_eq!(reply.next_stream_id.as_str(), "1713465536578-0");
+            assert_eq!(reply.claimed.len(), 2);
+            let ids: Vec<_> = reply.claimed.iter().map(|e| e.id.as_str()).collect();
+            assert!(ids.contains(&"1713465533411-0"));
+            assert!(ids.contains(&"1713465536069-0"));
+            assert_eq!(reply.deleted_ids.len(), 0);
+        }
+    }
+
+    mod stream_trim_options {
+        use super::*;
+
+        #[test]
+        fn maxlen_trim() {
+            let options = StreamTrimOptions::maxlen(StreamTrimmingMode::Approx, 10);
+
+            assert_command_eq(options, b"MAXLEN ~ 10");
+        }
+
+        #[test]
+        fn maxlen_exact_trim() {
+            let options = StreamTrimOptions::maxlen(StreamTrimmingMode::Exact, 10);
+
+            assert_command_eq(options, b"MAXLEN = 10");
+        }
+
+        #[test]
+        fn maxlen_trim_limit() {
+            let options = StreamTrimOptions::maxlen(StreamTrimmingMode::Approx, 10).limit(5);
+
+            assert_command_eq(options, b"MAXLEN ~ 10 LIMIT 5");
+        }
+        #[test]
+        fn minid_trim_limit() {
+            let options = StreamTrimOptions::minid(StreamTrimmingMode::Exact, "123456-7").limit(5);
+
+            assert_command_eq(options, b"MINID = 123456-7 LIMIT 5");
+        }
+    }
+
+    mod stream_add_options {
+        use super::*;
+
+        #[test]
+        fn the_default() {
+            let options = StreamAddOptions::default();
+
+            assert_command_eq(options, b"");
+        }
+
+        #[test]
+        fn with_maxlen_trim() {
+            let options = StreamAddOptions::default()
+                .trim(StreamTrimStrategy::maxlen(StreamTrimmingMode::Exact, 10));
+
+            assert_command_eq(options, b"MAXLEN = 10");
+        }
+
+        #[test]
+        fn with_nomkstream() {
+            let options = StreamAddOptions::default().nomkstream();
+
+            assert_command_eq(options, b"NOMKSTREAM");
+        }
+
+        #[test]
+        fn with_nomkstream_and_maxlen_trim() {
+            let options = StreamAddOptions::default()
+                .nomkstream()
+                .trim(StreamTrimStrategy::maxlen(StreamTrimmingMode::Exact, 10));
+
+            assert_command_eq(options, b"NOMKSTREAM MAXLEN = 10");
+        }
     }
 }

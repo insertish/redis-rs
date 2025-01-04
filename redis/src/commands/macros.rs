@@ -8,9 +8,10 @@ macro_rules! implement_commands {
         )*
     ) =>
     (
-        /// Implements common redis commands for connection like objects.  This
-        /// allows you to send commands straight to a connection or client.  It
-        /// is also implemented for redis results of clients which makes for
+        /// Implements common redis commands for connection like objects.
+        ///
+        /// This allows you to send commands straight to a connection or client.
+        /// It is also implemented for redis results of clients which makes for
         /// very convenient access in some basic cases.
         ///
         /// This allows you to use nicer syntax for some common operations.
@@ -20,7 +21,7 @@ macro_rules! implement_commands {
         /// # fn do_something() -> redis::RedisResult<()> {
         /// let client = redis::Client::open("redis://127.0.0.1/")?;
         /// let mut con = client.get_connection()?;
-        /// redis::cmd("SET").arg("my_key").arg(42).execute(&mut con);
+        /// redis::cmd("SET").arg("my_key").arg(42).exec(&mut con).unwrap();
         /// assert_eq!(redis::cmd("GET").arg("my_key").query(&mut con), Ok(42));
         /// # Ok(()) }
         /// ```
@@ -32,7 +33,7 @@ macro_rules! implement_commands {
         /// use redis::Commands;
         /// let client = redis::Client::open("redis://127.0.0.1/")?;
         /// let mut con = client.get_connection()?;
-        /// con.set("my_key", 42)?;
+        /// let _: () = con.set("my_key", 42)?;
         /// assert_eq!(con.get("my_key"), Ok(42));
         /// # Ok(()) }
         /// ```
@@ -51,6 +52,14 @@ macro_rules! implement_commands {
             fn scan<RV: FromRedisValue>(&mut self) -> RedisResult<Iter<'_, RV>> {
                 let mut c = cmd("SCAN");
                 c.cursor_arg(0);
+                c.iter(self)
+            }
+
+            /// Incrementally iterate the keys space with options.
+            #[inline]
+            fn scan_options<RV: FromRedisValue>(&mut self, opts: ScanOptions) -> RedisResult<Iter<'_, RV>> {
+                let mut c = cmd("SCAN");
+                c.cursor_arg(0).arg(opts);
                 c.iter(self)
             }
 
@@ -125,8 +134,9 @@ macro_rules! implement_commands {
             )*
         }
 
-        /// Implements common redis commands over asynchronous connections. This
-        /// allows you to send commands straight to a connection or client.
+        /// Implements common redis commands over asynchronous connections.
+        ///
+        /// This allows you to send commands straight to a connection or client.
         ///
         /// This allows you to use nicer syntax for some common operations.
         /// For instance this code:
@@ -135,8 +145,8 @@ macro_rules! implement_commands {
         /// use redis::AsyncCommands;
         /// # async fn do_something() -> redis::RedisResult<()> {
         /// let client = redis::Client::open("redis://127.0.0.1/")?;
-        /// let mut con = client.get_async_connection().await?;
-        /// redis::cmd("SET").arg("my_key").arg(42i32).query_async(&mut con).await?;
+        /// let mut con = client.get_multiplexed_async_connection().await?;
+        /// redis::cmd("SET").arg("my_key").arg(42i32).exec_async(&mut con).await?;
         /// assert_eq!(redis::cmd("GET").arg("my_key").query_async(&mut con).await, Ok(42i32));
         /// # Ok(()) }
         /// ```
@@ -148,8 +158,8 @@ macro_rules! implement_commands {
         /// # async fn do_something() -> redis::RedisResult<()> {
         /// use redis::Commands;
         /// let client = redis::Client::open("redis://127.0.0.1/")?;
-        /// let mut con = client.get_async_connection().await?;
-        /// con.set("my_key", 42i32).await?;
+        /// let mut con = client.get_multiplexed_async_connection().await?;
+        /// let _: () = con.set("my_key", 42i32).await?;
         /// assert_eq!(con.get("my_key").await, Ok(42i32));
         /// # Ok(()) }
         /// ```
@@ -175,6 +185,14 @@ macro_rules! implement_commands {
             fn scan<RV: FromRedisValue>(&mut self) -> crate::types::RedisFuture<crate::cmd::AsyncIter<'_, RV>> {
                 let mut c = cmd("SCAN");
                 c.cursor_arg(0);
+                Box::pin(async move { c.iter_async(self).await })
+            }
+
+            /// Incrementally iterate the keys space with options.
+            #[inline]
+            fn scan_options<RV: FromRedisValue>(&mut self, opts: ScanOptions) -> crate::types::RedisFuture<crate::cmd::AsyncIter<'_, RV>> {
+                let mut c = cmd("SCAN");
+                c.cursor_arg(0).arg(opts);
                 Box::pin(async move { c.iter_async(self).await })
             }
 

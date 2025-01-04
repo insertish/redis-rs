@@ -10,7 +10,7 @@ use std::{fmt, io};
 
 use crate::connection::ConnectionLike;
 use crate::pipeline::Pipeline;
-use crate::types::{from_redis_value, FromRedisValue, RedisResult, RedisWrite, ToRedisArgs};
+use crate::types::{from_owned_redis_value, FromRedisValue, RedisResult, RedisWrite, ToRedisArgs};
 
 /// An argument to a redis command
 #[derive(Clone)]
@@ -28,6 +28,8 @@ pub struct Cmd {
     // Arg::Simple contains the offset that marks the end of the argument
     args: Vec<Arg<usize>>,
     cursor: Option<u64>,
+    // If it's true command's response won't be read from socket. Useful for Pub/Sub.
+    no_response: bool,
 }
 
 /// Represents a redis iterator.
@@ -38,7 +40,7 @@ pub struct Iter<'a, T: FromRedisValue> {
     cmd: Cmd,
 }
 
-impl<'a, T: FromRedisValue> Iterator for Iter<'a, T> {
+impl<T: FromRedisValue> Iterator for Iter<'_, T> {
     type Item = T;
 
     #[inline]
@@ -55,12 +57,9 @@ impl<'a, T: FromRedisValue> Iterator for Iter<'a, T> {
                 return None;
             }
 
-            let pcmd = unwrap_or!(
-                self.cmd.get_packed_command_with_cursor(self.cursor),
-                return None
-            );
-            let rv = unwrap_or!(self.con.req_packed_command(&pcmd).ok(), return None);
-            let (cur, batch): (u64, Vec<T>) = unwrap_or!(from_redis_value(&rv).ok(), return None);
+            let pcmd = self.cmd.get_packed_command_with_cursor(self.cursor)?;
+            let rv = self.con.req_packed_command(&pcmd).ok()?;
+            let (cur, batch): (u64, Vec<T>) = from_owned_redis_value(rv).ok()?;
 
             self.cursor = cur;
             self.batch = batch.into_iter();
@@ -113,11 +112,8 @@ impl<'a, T: FromRedisValue + 'a> AsyncIterInner<'a, T> {
                 return None;
             }
 
-            let rv = unwrap_or!(
-                self.con.req_packed_command(&self.cmd).await.ok(),
-                return None
-            );
-            let (cur, batch): (u64, Vec<T>) = unwrap_or!(from_redis_value(&rv).ok(), return None);
+            let rv = self.con.req_packed_command(&self.cmd).await.ok()?;
+            let (cur, batch): (u64, Vec<T>) = from_owned_redis_value(rv).ok()?;
 
             self.cmd.cursor = Some(cur);
             self.batch = batch.into_iter();
@@ -131,9 +127,9 @@ impl<'a, T: FromRedisValue + 'a + Unpin + Send> AsyncIter<'a, T> {
     /// # use redis::AsyncCommands;
     /// # async fn scan_set() -> redis::RedisResult<()> {
     /// # let client = redis::Client::open("redis://127.0.0.1/")?;
-    /// # let mut con = client.get_async_connection().await?;
-    /// con.sadd("my_set", 42i32).await?;
-    /// con.sadd("my_set", 43i32).await?;
+    /// # let mut con = client.get_multiplexed_async_connection().await?;
+    /// let _: () = con.sadd("my_set", 42i32).await?;
+    /// let _: () = con.sadd("my_set", 43i32).await?;
     /// let mut iter: redis::AsyncIter<i32> = con.sscan("my_set").await?;
     /// while let Some(element) = iter.next_item().await {
     ///     assert!(element == 42 || element == 43);
@@ -152,7 +148,7 @@ impl<'a, T: FromRedisValue + Unpin + Send + 'a> Stream for AsyncIter<'a, T> {
     type Item = T;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<T>> {
-        let mut this = self.get_mut();
+        let this = self.get_mut();
         let inner = std::mem::replace(&mut this.inner, IterOrFuture::Empty);
         match inner {
             IterOrFuture::Iter(mut iter) => {
@@ -291,7 +287,7 @@ impl Default for Cmd {
 }
 
 /// A command acts as a builder interface to creating encoded redis
-/// requests.  This allows you to easiy assemble a packed command
+/// requests.  This allows you to easily assemble a packed command
 /// by chaining arguments together.
 ///
 /// Basic example:
@@ -324,16 +320,25 @@ impl Cmd {
             data: vec![],
             args: vec![],
             cursor: None,
+            no_response: false,
         }
     }
 
-    /// Creates a new empty command, with at least the requested capcity.
+    /// Creates a new empty command, with at least the requested capacity.
     pub fn with_capacity(arg_count: usize, size_of_data: usize) -> Cmd {
         Cmd {
             data: Vec::with_capacity(size_of_data),
             args: Vec::with_capacity(arg_count),
             cursor: None,
+            no_response: false,
         }
+    }
+
+    /// Get the capacities for the internal buffers.
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) fn capacity(&self) -> (usize, usize) {
+        (self.args.capacity(), self.data.capacity())
     }
 
     /// Appends an argument to the command.  The argument passed must
@@ -418,7 +423,7 @@ impl Cmd {
     #[inline]
     pub fn query<T: FromRedisValue>(&self, con: &mut dyn ConnectionLike) -> RedisResult<T> {
         match con.req_command(self) {
-            Ok(val) => from_redis_value(&val),
+            Ok(val) => from_owned_redis_value(val.extract_error()?),
             Err(e) => Err(e),
         }
     }
@@ -426,12 +431,12 @@ impl Cmd {
     /// Async version of `query`.
     #[inline]
     #[cfg(feature = "aio")]
-    pub async fn query_async<C, T: FromRedisValue>(&self, con: &mut C) -> RedisResult<T>
-    where
-        C: crate::aio::ConnectionLike,
-    {
+    pub async fn query_async<T: FromRedisValue>(
+        &self,
+        con: &mut impl crate::aio::ConnectionLike,
+    ) -> RedisResult<T> {
         let val = con.req_packed_command(self).await?;
-        from_redis_value(&val)
+        from_owned_redis_value(val.extract_error()?)
     }
 
     /// Similar to `query()` but returns an iterator over the items of the
@@ -453,9 +458,9 @@ impl Cmd {
         let rv = con.req_command(&self)?;
 
         let (cursor, batch) = if rv.looks_like_cursor() {
-            from_redis_value::<(u64, Vec<T>)>(&rv)?
+            from_owned_redis_value::<(u64, Vec<T>)>(rv)?
         } else {
-            (0, from_redis_value(&rv)?)
+            (0, from_owned_redis_value(rv)?)
         };
 
         Ok(Iter {
@@ -490,9 +495,9 @@ impl Cmd {
         let rv = con.req_packed_command(&self).await?;
 
         let (cursor, batch) = if rv.looks_like_cursor() {
-            from_redis_value::<(u64, Vec<T>)>(&rv)?
+            from_owned_redis_value::<(u64, Vec<T>)>(rv)?
         } else {
-            (0, from_redis_value(&rv)?)
+            (0, from_owned_redis_value(rv)?)
         };
         if cursor == 0 {
             self.cursor = None;
@@ -519,15 +524,34 @@ impl Cmd {
     /// ```rust,no_run
     /// # let client = redis::Client::open("redis://127.0.0.1/").unwrap();
     /// # let mut con = client.get_connection().unwrap();
-    /// let _ : () = redis::cmd("PING").query(&mut con).unwrap();
+    /// redis::cmd("PING").query::<()>(&mut con).unwrap();
     /// ```
     #[inline]
+    #[deprecated(note = "Use Cmd::exec + unwrap, instead")]
     pub fn execute(&self, con: &mut dyn ConnectionLike) {
-        self.query::<()>(con).unwrap();
+        self.exec(con).unwrap();
+    }
+
+    /// This is an alternative to `query`` that can be used if you want to be able to handle a
+    /// command's success or failure but don't care about the command's response. For example,
+    /// this is useful for "SET" commands for which the response's content is not important.
+    /// It avoids the need to define generic bounds for ().
+    #[inline]
+    pub fn exec(&self, con: &mut dyn ConnectionLike) -> RedisResult<()> {
+        self.query::<()>(con)
+    }
+
+    /// This is an alternative to `query_async` that can be used if you want to be able to handle a
+    /// command's success or failure but don't care about the command's response. For example,
+    /// this is useful for "SET" commands for which the response's content is not important.
+    /// It avoids the need to define generic bounds for ().
+    #[cfg(feature = "aio")]
+    pub async fn exec_async(&self, con: &mut impl crate::aio::ConnectionLike) -> RedisResult<()> {
+        self.query_async::<()>(con).await
     }
 
     /// Returns an iterator over the arguments in this command (including the command name itself)
-    pub fn args_iter(&self) -> impl Iterator<Item = Arg<&[u8]>> + Clone + ExactSizeIterator {
+    pub fn args_iter(&self) -> impl Clone + ExactSizeIterator<Item = Arg<&[u8]>> {
         let mut prev = 0;
         self.args.iter().map(move |arg| match *arg {
             Arg::Simple(i) => {
@@ -564,6 +588,19 @@ impl Cmd {
         }
         Some(&self.data[start..end])
     }
+
+    /// Client won't read and wait for results. Currently only used for Pub/Sub commands in RESP3.
+    #[inline]
+    pub fn set_no_response(&mut self, nr: bool) -> &mut Cmd {
+        self.no_response = nr;
+        self
+    }
+
+    /// Check whether command's result will be waited for.
+    #[inline]
+    pub fn is_no_response(&self) -> bool {
+        self.no_response
+    }
 }
 
 /// Shortcut function to creating a command with a single argument.
@@ -581,10 +618,12 @@ pub fn cmd(name: &str) -> Cmd {
     rv
 }
 
-/// Packs a bunch of commands into a request.  This is generally a quite
-/// useless function as this functionality is nicely wrapped through the
-/// `Cmd` object, but in some cases it can be useful.  The return value
-/// of this can then be send to the low level `ConnectionLike` methods.
+/// Packs a bunch of commands into a request.
+///
+/// This is generally a quite useless function as this functionality is
+/// nicely wrapped through the `Cmd` object, but in some cases it can be
+/// useful.  The return value of this can then be send to the low level
+/// `ConnectionLike` methods.
 ///
 /// Example:
 ///

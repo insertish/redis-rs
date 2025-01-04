@@ -124,7 +124,7 @@ fn add_records(client: &redis::Client) -> RedisResult<()> {
 
     // a stream whose records have two fields
     for _ in 0..thrifty_rand() {
-        con.xadd_maxlen(
+        let _: () = con.xadd_maxlen(
             DOG_STREAM,
             maxlen,
             "*",
@@ -134,7 +134,7 @@ fn add_records(client: &redis::Client) -> RedisResult<()> {
 
     // a streams whose records have three fields
     for _ in 0..thrifty_rand() {
-        con.xadd_maxlen(
+        let _: () = con.xadd_maxlen(
             CAT_STREAM,
             maxlen,
             "*",
@@ -148,7 +148,7 @@ fn add_records(client: &redis::Client) -> RedisResult<()> {
 
     // a streams whose records have four fields
     for _ in 0..thrifty_rand() {
-        con.xadd_maxlen(
+        let _: () = con.xadd_maxlen(
             DUCK_STREAM,
             maxlen,
             "*",
@@ -220,7 +220,7 @@ fn read_records(client: &redis::Client) -> RedisResult<()> {
         for StreamId { id, map } in ids {
             println!("\tID {id}");
             for (n, s) in map {
-                if let Value::Data(bytes) = s {
+                if let Value::BulkString(bytes) = s {
                     println!("\t\t{}: {}", n, String::from_utf8(bytes).expect("utf8"))
                 } else {
                     panic!("Weird data")

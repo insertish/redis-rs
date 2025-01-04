@@ -2,6 +2,7 @@
 #![cfg(feature = "cluster")]
 use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
 use redis::cluster::cluster_pipe;
+use redis_test::cluster::RedisClusterConfiguration;
 
 use support::*;
 
@@ -17,7 +18,7 @@ fn bench_set_get_and_del(c: &mut Criterion, con: &mut redis::cluster::ClusterCon
 
     group.bench_function("set", |b| {
         b.iter(|| {
-            redis::cmd("SET").arg(key).arg(42).execute(con);
+            redis::cmd("SET").arg(key).arg(42).exec(con).unwrap();
             black_box(())
         })
     });
@@ -27,8 +28,8 @@ fn bench_set_get_and_del(c: &mut Criterion, con: &mut redis::cluster::ClusterCon
     });
 
     let mut set_and_del = || {
-        redis::cmd("SET").arg(key).arg(42).execute(con);
-        redis::cmd("DEL").arg(key).execute(con);
+        redis::cmd("SET").arg(key).arg(42).exec(con).unwrap();
+        redis::cmd("DEL").arg(key).exec(con).unwrap();
     };
     group.bench_function("set_and_del", |b| {
         b.iter(|| {
@@ -68,7 +69,7 @@ fn bench_pipeline(c: &mut Criterion, con: &mut redis::cluster::ClusterConnection
     }
     group.bench_function("query_pipeline", |b| {
         b.iter(|| {
-            pipe.query::<()>(con).unwrap();
+            pipe.exec(con).unwrap();
             black_box(())
         })
     });
@@ -77,7 +78,8 @@ fn bench_pipeline(c: &mut Criterion, con: &mut redis::cluster::ClusterConnection
 }
 
 fn bench_cluster_setup(c: &mut Criterion) {
-    let cluster = TestClusterContext::new(6, 1);
+    let cluster =
+        TestClusterContext::new_with_config(RedisClusterConfiguration::single_replica_config());
     cluster.wait_for_cluster_up();
 
     let mut con = cluster.connection();
@@ -87,9 +89,10 @@ fn bench_cluster_setup(c: &mut Criterion) {
 
 #[allow(dead_code)]
 fn bench_cluster_read_from_replicas_setup(c: &mut Criterion) {
-    let cluster = TestClusterContext::new_with_cluster_client_builder(6, 1, |builder| {
-        builder.read_from_replicas()
-    });
+    let cluster = TestClusterContext::new_with_config_and_builder(
+        RedisClusterConfiguration::single_replica_config(),
+        |builder| builder.read_from_replicas(),
+    );
     cluster.wait_for_cluster_up();
 
     let mut con = cluster.connection();

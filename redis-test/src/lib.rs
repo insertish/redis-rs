@@ -23,8 +23,12 @@
 //! assert_eq!(result, true);
 //! ```
 
+pub mod cluster;
+pub mod sentinel;
+pub mod server;
+pub mod utils;
+
 use std::collections::VecDeque;
-use std::iter::FromIterator;
 use std::sync::{Arc, Mutex};
 
 use redis::{Cmd, ConnectionLike, ErrorKind, Pipeline, RedisError, RedisResult, Value};
@@ -45,26 +49,26 @@ pub trait IntoRedisValue {
 
 impl IntoRedisValue for String {
     fn into_redis_value(self) -> Value {
-        Value::Data(self.as_bytes().to_vec())
+        Value::BulkString(self.as_bytes().to_vec())
     }
 }
 
 impl IntoRedisValue for &str {
     fn into_redis_value(self) -> Value {
-        Value::Data(self.as_bytes().to_vec())
+        Value::BulkString(self.as_bytes().to_vec())
     }
 }
 
 #[cfg(feature = "bytes")]
 impl IntoRedisValue for bytes::Bytes {
     fn into_redis_value(self) -> Value {
-        Value::Data(self.to_vec())
+        Value::BulkString(self.to_vec())
     }
 }
 
 impl IntoRedisValue for Vec<u8> {
     fn into_redis_value(self) -> Value {
-        Value::Data(self)
+        Value::BulkString(self)
     }
 }
 
@@ -305,13 +309,13 @@ mod tests {
             MockCmd::new(cmd("GET").arg("bar"), Ok("foo")),
         ]);
 
-        cmd("SET").arg("foo").arg(42).execute(&mut conn);
+        cmd("SET").arg("foo").arg(42).exec(&mut conn).unwrap();
         assert_eq!(cmd("GET").arg("foo").query(&mut conn), Ok(42));
 
-        cmd("SET").arg("bar").arg("foo").execute(&mut conn);
+        cmd("SET").arg("bar").arg("foo").exec(&mut conn).unwrap();
         assert_eq!(
             cmd("GET").arg("bar").query(&mut conn),
-            Ok(Value::Data(b"foo".as_ref().into()))
+            Ok(Value::BulkString(b"foo".as_ref().into()))
         );
     }
 
@@ -328,7 +332,7 @@ mod tests {
         cmd("SET")
             .arg("foo")
             .arg("42")
-            .query_async::<_, ()>(&mut conn)
+            .exec_async(&mut conn)
             .await
             .unwrap();
         let result: Result<usize, _> = cmd("GET").arg("foo").query_async(&mut conn).await;
@@ -337,7 +341,7 @@ mod tests {
         cmd("SET")
             .arg("bar")
             .arg("foo")
-            .query_async::<_, ()>(&mut conn)
+            .exec_async(&mut conn)
             .await
             .unwrap();
         let result: Result<Vec<u8>, _> = cmd("GET").arg("bar").query_async(&mut conn).await;
@@ -351,13 +355,13 @@ mod tests {
             MockCmd::new(cmd("GET").arg("foo"), Ok(42)),
         ]);
 
-        cmd("SET").arg("foo").arg(42).execute(&mut conn);
+        cmd("SET").arg("foo").arg(42).exec(&mut conn).unwrap();
         assert_eq!(cmd("GET").arg("foo").query(&mut conn), Ok(42));
 
         let err = cmd("SET")
             .arg("bar")
             .arg("foo")
-            .query::<()>(&mut conn)
+            .exec(&mut conn)
             .unwrap_err();
         assert_eq!(err.kind(), ErrorKind::ClientError);
         assert_eq!(err.detail(), Some("unexpected command"));
@@ -371,11 +375,11 @@ mod tests {
             MockCmd::new(cmd("SET").arg("bar").arg("foo"), Ok("")),
         ]);
 
-        cmd("SET").arg("foo").arg(42).execute(&mut conn);
+        cmd("SET").arg("foo").arg(42).exec(&mut conn).unwrap();
         let err = cmd("SET")
             .arg("bar")
             .arg("foo")
-            .query::<()>(&mut conn)
+            .exec(&mut conn)
             .unwrap_err();
         assert_eq!(err.kind(), ErrorKind::ClientError);
         assert!(err.detail().unwrap().contains("unexpected command"));
@@ -402,10 +406,10 @@ mod tests {
     fn pipeline_atomic_test() {
         let mut conn = MockRedisConnection::new(vec![MockCmd::with_values(
             pipe().atomic().cmd("GET").arg("foo").cmd("GET").arg("bar"),
-            Ok(vec![Value::Bulk(
+            Ok(vec![Value::Array(
                 vec!["hello", "world"]
                     .into_iter()
-                    .map(|x| Value::Data(x.as_bytes().into()))
+                    .map(|x| Value::BulkString(x.as_bytes().into()))
                     .collect(),
             )]),
         )]);

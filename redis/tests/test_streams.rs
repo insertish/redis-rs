@@ -11,16 +11,6 @@ use std::str;
 use std::thread::sleep;
 use std::time::Duration;
 
-macro_rules! assert_args {
-    ($value:expr, $($args:expr),+) => {
-        let args = $value.to_redis_args();
-        let strings: Vec<_> = args.iter()
-                                .map(|a| str::from_utf8(a.as_ref()).unwrap())
-                                .collect();
-        assert_eq!(strings, vec![$($args),+]);
-    }
-}
-
 fn xadd(con: &mut Connection) {
     let _: RedisResult<String> =
         con.xadd("k1", "1000-0", &[("hello", "world"), ("redis", "streams")]);
@@ -84,14 +74,14 @@ fn test_cmd_options() {
 
     assert_args!(
         &opts,
+        "GROUP",
+        "group-name",
+        "consumer-name",
         "BLOCK",
         "100",
         "COUNT",
         "200",
-        "NOACK",
-        "GROUP",
-        "group-name",
-        "consumer-name"
+        "NOACK"
     );
 
     // should skip noack because of missing group(,)
@@ -146,9 +136,9 @@ fn test_assorted_1() {
     let _: RedisResult<String> = con.xadd_map("k3", "3000-0", map);
 
     let reply: StreamRangeReply = con.xrange_all("k3").unwrap();
-    assert!(reply.ids[0].contains_key(&"ab"));
-    assert!(reply.ids[0].contains_key(&"ef"));
-    assert!(reply.ids[0].contains_key(&"ij"));
+    assert!(reply.ids[0].contains_key("ab"));
+    assert!(reply.ids[0].contains_key("ef"));
+    assert!(reply.ids[0].contains_key("ij"));
 
     // test xadd w/ maxlength below...
 
@@ -181,7 +171,11 @@ fn test_xgroup_create() {
 
     // no key exists... this call breaks the connection pipe for some reason
     let reply: RedisResult<StreamInfoStreamReply> = con.xinfo_stream("k10");
-    assert!(reply.is_err());
+    assert!(
+        matches!(&reply, Err(e) if e.kind() == redis::ErrorKind::ResponseError
+            && e.code() == Some("ERR")
+            && e.detail() == Some("no such key"))
+    );
 
     // redo the connection because the above error
     con = ctx.connection();
@@ -202,6 +196,62 @@ fn test_xgroup_create() {
     let reply = result.unwrap();
     assert_eq!(&reply.groups.len(), &1);
     assert_eq!(&reply.groups[0].name, &"g1");
+}
+
+#[test]
+fn test_xgroup_createconsumer() {
+    // Tests the following command....
+    // xgroup_createconsumer
+
+    let ctx = TestContext::new();
+    let mut con = ctx.connection();
+
+    xadd(&mut con);
+
+    // key should exist
+    let reply: StreamInfoStreamReply = con.xinfo_stream("k1").unwrap();
+    assert_eq!(&reply.first_entry.id, "1000-0");
+    assert_eq!(&reply.last_entry.id, "1000-1");
+    assert_eq!(&reply.last_generated_id, "1000-1");
+
+    // xgroup create (existing stream)
+    let result: RedisResult<String> = con.xgroup_create("k1", "g1", "$");
+    assert!(result.is_ok());
+
+    // xinfo groups (existing stream)
+    let result: RedisResult<StreamInfoGroupsReply> = con.xinfo_groups("k1");
+    assert!(result.is_ok());
+    let reply = result.unwrap();
+    assert_eq!(&reply.groups.len(), &1);
+    assert_eq!(&reply.groups[0].name, &"g1");
+
+    // xinfo consumers (consumer does not exist)
+    let result: RedisResult<StreamInfoConsumersReply> = con.xinfo_consumers("k1", "g1");
+    assert!(result.is_ok());
+    let reply = result.unwrap();
+    assert_eq!(&reply.consumers.len(), &0);
+
+    // xgroup_createconsumer
+    let result: RedisResult<i32> = con.xgroup_createconsumer("k1", "g1", "c1");
+    assert!(matches!(result, Ok(1)));
+
+    // xinfo consumers (consumer was created)
+    let result: RedisResult<StreamInfoConsumersReply> = con.xinfo_consumers("k1", "g1");
+    assert!(result.is_ok());
+    let reply = result.unwrap();
+    assert_eq!(&reply.consumers.len(), &1);
+    assert_eq!(&reply.consumers[0].name, &"c1");
+
+    // second call will not create consumer
+    let result: RedisResult<i32> = con.xgroup_createconsumer("k1", "g1", "c1");
+    assert!(matches!(result, Ok(0)));
+
+    // xinfo consumers (consumer still exists)
+    let result: RedisResult<StreamInfoConsumersReply> = con.xinfo_consumers("k1", "g1");
+    assert!(result.is_ok());
+    let reply = result.unwrap();
+    assert_eq!(&reply.consumers.len(), &1);
+    assert_eq!(&reply.consumers[0].name, &"c1");
 }
 
 #[test]
@@ -235,11 +285,25 @@ fn test_assorted_2() {
     assert_eq!(&reply.groups.len(), &1);
     assert_eq!(&reply.groups[0].name, &"g99");
     assert_eq!(&reply.groups[0].last_delivered_id, &"0-0");
+    if let Some(lag) = reply.groups[0].lag {
+        assert_eq!(lag, 0);
+    }
 
     // call xadd on k99 just so we can read from it
     // using consumer g99 and test xinfo_consumers
     let _: RedisResult<String> = con.xadd("k99", "1000-0", &[("a", "b"), ("c", "d")]);
     let _: RedisResult<String> = con.xadd("k99", "1000-1", &[("e", "f"), ("g", "h")]);
+
+    // Two messages have been added but not acked:
+    // this should give us a `lag` of 2 (if the server supports it)
+    let result: RedisResult<StreamInfoGroupsReply> = con.xinfo_groups("k99");
+    assert!(result.is_ok());
+    let reply = result.unwrap();
+    assert_eq!(&reply.groups.len(), &1);
+    assert_eq!(&reply.groups[0].name, &"g99");
+    if let Some(lag) = reply.groups[0].lag {
+        assert_eq!(lag, 2);
+    }
 
     // test empty PEL
     let empty_reply: StreamPendingReply = con.xpending("k99", "g99").unwrap();
@@ -362,6 +426,81 @@ fn test_xadd_maxlen_map() {
 }
 
 #[test]
+fn test_xadd_options() {
+    let ctx = TestContext::new();
+    let mut con = ctx.connection();
+
+    // NoMKStream will return a nil when the stream does not exist
+    let result: RedisResult<redis::Value> = con.xadd_options(
+        "k1",
+        "*",
+        &[("h", "w")],
+        &StreamAddOptions::default().nomkstream(),
+    );
+    assert_eq!(result, Ok(redis::Value::Nil));
+
+    let result: RedisResult<StreamInfoStreamReply> = con.xinfo_stream("k1");
+    assert!(
+        matches!(&result, Err(e) if e.kind() == redis::ErrorKind::ResponseError
+            && e.code() == Some("ERR")
+            && e.detail() == Some("no such key"))
+    );
+
+    fn setup_stream(con: &mut Connection) {
+        let _: RedisResult<()> = con.del("k1");
+
+        for i in 0..10 {
+            let _: RedisResult<String> = con.xadd_options(
+                "k1",
+                format!("1-{i}"),
+                &[("h", "w")],
+                &StreamAddOptions::default(),
+            );
+        }
+    }
+
+    // test trim by maxlen
+    setup_stream(&mut con);
+
+    let _: RedisResult<String> = con.xadd_options(
+        "k1",
+        "2-1",
+        &[("h", "w")],
+        &StreamAddOptions::default().trim(StreamTrimStrategy::maxlen(StreamTrimmingMode::Exact, 4)),
+    );
+
+    let info: StreamInfoStreamReply = con.xinfo_stream("k1").unwrap();
+    assert_eq!(info.length, 4);
+    assert_eq!(info.first_entry.id, "1-7");
+
+    // test with trim by minid
+    setup_stream(&mut con);
+
+    let _: RedisResult<String> = con.xadd_options(
+        "k1",
+        "2-1",
+        &[("h", "w")],
+        &StreamAddOptions::default()
+            .trim(StreamTrimStrategy::minid(StreamTrimmingMode::Exact, "1-5")),
+    );
+    let info: StreamInfoStreamReply = con.xinfo_stream("k1").unwrap();
+    assert_eq!(info.length, 6);
+    assert_eq!(info.first_entry.id, "1-5");
+
+    // test adding from a map
+    let mut map: BTreeMap<&str, &str> = BTreeMap::new();
+    map.insert("ab", "cd");
+    map.insert("ef", "gh");
+    map.insert("ij", "kl");
+    let _: RedisResult<String> = con.xadd_options("k1", "3-1", map, &StreamAddOptions::default());
+
+    let info: StreamInfoStreamReply = con.xinfo_stream("k1").unwrap();
+    assert_eq!(info.length, 7);
+    assert_eq!(info.first_entry.id, "1-5");
+    assert_eq!(info.last_entry.id, "3-1");
+}
+
+#[test]
 fn test_xread_options_deleted_pel_entry() {
     // Test xread_options behaviour with deleted entry
     let ctx = TestContext::new();
@@ -397,6 +536,88 @@ fn test_xread_options_deleted_pel_entry() {
         result_deleted_entry.keys[0].ids[0].id
     );
 }
+
+#[test]
+fn test_xautoclaim() {
+    // Tests the following command....
+    // xautoclaim_options
+    let ctx = TestContext::new();
+    let mut con = ctx.connection();
+
+    // xautoclaim test basic idea:
+    // 1. we need to test adding messages to a group
+    // 2. then xreadgroup needs to define a consumer and read pending
+    //    messages without acking them
+    // 3. then we need to sleep 5ms and call xautoclaim to claim message
+    //    past the idle time and read them from a different consumer
+
+    // create the group
+    let result: RedisResult<String> = con.xgroup_create_mkstream("k1", "g1", "$");
+    assert!(result.is_ok());
+
+    // add some keys
+    xadd_keyrange(&mut con, "k1", 0, 10);
+
+    // read the pending items for this key & group
+    let reply: StreamReadReply = con
+        .xread_options(
+            &["k1"],
+            &[">"],
+            &StreamReadOptions::default().group("g1", "c1"),
+        )
+        .unwrap();
+    // verify we have 10 ids
+    assert_eq!(reply.keys[0].ids.len(), 10);
+
+    // save this StreamId for later
+    let claim = &reply.keys[0].ids[0];
+    let claim_1 = &reply.keys[0].ids[1];
+
+    // sleep for 5ms
+    sleep(Duration::from_millis(10));
+
+    // grab this id if > 4ms
+    let reply: StreamAutoClaimReply = con
+        .xautoclaim_options(
+            "k1",
+            "g1",
+            "c2",
+            4,
+            claim.id.clone(),
+            StreamAutoClaimOptions::default().count(2),
+        )
+        .unwrap();
+    assert_eq!(reply.claimed.len(), 2);
+    assert_eq!(reply.claimed[0].id, claim.id);
+    assert!(!reply.claimed[0].map.is_empty());
+    assert_eq!(reply.claimed[1].id, claim_1.id);
+    assert!(!reply.claimed[1].map.is_empty());
+
+    // sleep for 5ms
+    sleep(Duration::from_millis(5));
+
+    // let's test some of the xautoclaim_options
+    // call force on the same claim.id
+    let reply: StreamAutoClaimReply = con
+        .xautoclaim_options(
+            "k1",
+            "g1",
+            "c3",
+            4,
+            claim.id.clone(),
+            StreamAutoClaimOptions::default().count(5).with_justid(),
+        )
+        .unwrap();
+
+    // we just claimed the first original 5 ids
+    // and only returned the ids
+    assert_eq!(reply.claimed.len(), 5);
+    assert_eq!(reply.claimed[0].id, claim.id);
+    assert!(reply.claimed[0].map.is_empty());
+    assert_eq!(reply.claimed[1].id, claim_1.id);
+    assert!(reply.claimed[1].map.is_empty());
+}
+
 #[test]
 fn test_xclaim() {
     // Tests the following commands....
@@ -433,7 +654,6 @@ fn test_xclaim() {
 
     // save this StreamId for later
     let claim = &reply.keys[0].ids[0];
-    let _claim_1 = &reply.keys[0].ids[1];
     let claim_justids = &reply.keys[0]
         .ids
         .iter()
@@ -503,6 +723,80 @@ fn test_xclaim() {
 }
 
 #[test]
+fn test_xclaim_last_id() {
+    let ctx = TestContext::new();
+    let mut con = ctx.connection();
+
+    let result: RedisResult<String> = con.xgroup_create_mkstream("k1", "g1", "$");
+    assert!(result.is_ok());
+
+    // add some keys
+    xadd_keyrange(&mut con, "k1", 0, 10);
+
+    let reply: StreamReadReply = con
+        .xread_options(&["k1"], &["0"], &StreamReadOptions::default())
+        .unwrap();
+    // verify we have 10 ids
+    assert_eq!(reply.keys[0].ids.len(), 10);
+
+    let claim_early_id = &reply.keys[0].ids[3];
+    let claim_middle_id = &reply.keys[0].ids[5];
+    let claim_late_id = &reply.keys[0].ids[8];
+
+    // get read up to the middle record
+    let _: StreamReadReply = con
+        .xread_options(
+            &["k1"],
+            &[">"],
+            &StreamReadOptions::default().count(6).group("g1", "c1"),
+        )
+        .unwrap();
+
+    let info: StreamInfoGroupsReply = con.xinfo_groups("k1").unwrap();
+    assert_eq!(info.groups[0].last_delivered_id, claim_middle_id.id.clone());
+
+    // sleep for 5ms
+    sleep(Duration::from_millis(5));
+
+    let _: Vec<String> = con
+        .xclaim_options(
+            "k1",
+            "g1",
+            "c2",
+            4,
+            &[claim_middle_id.id.clone()],
+            StreamClaimOptions::default()
+                .with_justid()
+                .with_lastid(claim_early_id.id.as_str()),
+        )
+        .unwrap();
+
+    // lastid is kept at the 6th entry as the 4th entry is OLDER than the last_delivered_id
+    let info: StreamInfoGroupsReply = con.xinfo_groups("k1").unwrap();
+    assert_eq!(info.groups[0].last_delivered_id, claim_middle_id.id.clone());
+
+    // sleep for 5ms
+    sleep(Duration::from_millis(5));
+
+    let _: Vec<String> = con
+        .xclaim_options(
+            "k1",
+            "g1",
+            "c1",
+            4,
+            &[claim_middle_id.id.clone()],
+            StreamClaimOptions::default()
+                .with_justid()
+                .with_lastid(claim_late_id.id.as_str()),
+        )
+        .unwrap();
+
+    // lastid is moved to the 8th entry as it is NEWER than the last_delivered_id
+    let info: StreamInfoGroupsReply = con.xinfo_groups("k1").unwrap();
+    assert_eq!(info.groups[0].last_delivered_id, claim_late_id.id.clone());
+}
+
+#[test]
 fn test_xdel() {
     // Tests the following commands....
     // xdel
@@ -539,6 +833,52 @@ fn test_xtrim() {
     // we should end up with 40 after this call
     let result: RedisResult<i32> = con.xtrim("k1", StreamMaxlen::Equals(10));
     assert_eq!(result, Ok(40));
+}
+
+#[test]
+fn test_xtrim_options() {
+    // Tests the following commands....
+    // xtrim_options
+    let ctx = TestContext::new();
+    let mut con = ctx.connection();
+
+    // add some keys
+    xadd_keyrange(&mut con, "k1", 0, 100);
+
+    // trim key to 50
+    // returns the number of items deleted from the stream
+    let result: RedisResult<i32> = con.xtrim_options(
+        "k1",
+        &StreamTrimOptions::maxlen(StreamTrimmingMode::Exact, 50),
+    );
+    assert_eq!(result, Ok(50));
+
+    // we should end up with 40 deleted this call
+    let result: RedisResult<i32> = con.xtrim_options(
+        "k1",
+        &StreamTrimOptions::maxlen(StreamTrimmingMode::Exact, 10),
+    );
+    assert_eq!(result, Ok(40));
+
+    let _: RedisResult<()> = con.del("k1");
+
+    for i in 1..100 {
+        let _: RedisResult<String> = con.xadd("k1", format!("1-{i}"), &[("h", "w")]);
+    }
+
+    // Trim to id 1-26
+    let result: RedisResult<i32> = con.xtrim_options(
+        "k1",
+        &StreamTrimOptions::minid(StreamTrimmingMode::Exact, "1-26"),
+    );
+    assert_eq!(result, Ok(25));
+
+    // we should end up with 50 deleted this call
+    let result: RedisResult<i32> = con.xtrim_options(
+        "k1",
+        &StreamTrimOptions::minid(StreamTrimmingMode::Exact, "1-76"),
+    );
+    assert_eq!(result, Ok(50));
 }
 
 #[test]

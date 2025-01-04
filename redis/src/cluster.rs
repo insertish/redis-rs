@@ -1,7 +1,13 @@
 //! This module extends the library to support Redis Cluster.
 //!
-//! Note that this module does not currently provide pubsub
-//! functionality.
+//! The cluster connection is meant to abstract the fact that a cluster is composed of multiple nodes,
+//! and to provide an API which is as close as possible to that of a single node connection. In order to do that,
+//! the cluster connection maintains connections to each node in the Redis/ Valkey cluster, and can route
+//! requests automatically to the relevant nodes. In cases that the cluster connection receives indications
+//! that the cluster topology has changed, it will query nodes in order to find the current cluster topology.
+//! If it disconnects from some nodes, it will automatically reconnect to those nodes.
+//!
+//! Note that pubsub & push sending functionality is not currently provided by this module.
 //!
 //! # Example
 //! ```rust,no_run
@@ -29,36 +35,140 @@
 //!
 //! let key = "test";
 //!
-//! let _: () = cluster_pipe()
+//! cluster_pipe()
 //!     .rpush(key, "123").ignore()
 //!     .ltrim(key, -10, -1).ignore()
 //!     .expire(key, 60).ignore()
-//!     .query(&mut connection).unwrap();
+//!     .exec(&mut connection).unwrap();
+//! ```
+//!
+//! # Sending request to specific node
+//! In some cases you'd want to send a request to a specific node in the cluster, instead of
+//! letting the cluster connection decide by itself to which node it should send the request.
+//! This can happen, for example, if you want to send SCAN commands to each node in the cluster.
+//!
+//! ```rust,no_run
+//! use redis::Commands;
+//! use redis::cluster::ClusterClient;
+//! use redis::cluster_routing::{ RoutingInfo, SingleNodeRoutingInfo };
+//!
+//! let nodes = vec!["redis://127.0.0.1:6379/", "redis://127.0.0.1:6378/", "redis://127.0.0.1:6377/"];
+//! let client = ClusterClient::new(nodes).unwrap();
+//! let mut connection = client.get_connection().unwrap();
+//!
+//! let routing_info = RoutingInfo::SingleNode(SingleNodeRoutingInfo::ByAddress{
+//!     host: "redis://127.0.0.1".to_string(),
+//!     port: 6378
+//! });
+//! let _: redis::Value = connection.route_command(&redis::cmd("PING"), routing_info).unwrap();
 //! ```
 use std::cell::RefCell;
-use std::iter::Iterator;
+use std::collections::HashSet;
 use std::str::FromStr;
 use std::thread;
 use std::time::Duration;
 
-use rand::{seq::IteratorRandom, thread_rng, Rng};
-
 use crate::cluster_pipeline::UNROUTABLE_ERROR;
-use crate::cluster_routing::{Routable, RoutingInfo, Slot, SLOT_SIZE};
+use crate::cluster_routing::{
+    MultipleNodeRoutingInfo, ResponsePolicy, Routable, SingleNodeRoutingInfo, SlotAddr,
+};
+use crate::cluster_topology::parse_slots;
 use crate::cmd::{cmd, Cmd};
 use crate::connection::{
     connect, Connection, ConnectionAddr, ConnectionInfo, ConnectionLike, RedisConnectionInfo,
 };
 use crate::parser::parse_redis_value;
-use crate::types::{ErrorKind, HashMap, HashSet, RedisError, RedisResult, Value};
+use crate::types::{ErrorKind, HashMap, RedisError, RedisResult, Value};
 use crate::IntoConnectionInfo;
+pub use crate::TlsMode; // Pub for backwards compatibility
 use crate::{
     cluster_client::ClusterParams,
-    cluster_routing::{Route, SlotAddr, SlotAddrs, SlotMap},
+    cluster_routing::{Redirect, Route, RoutingInfo, SlotMap, SLOT_SIZE},
 };
+use rand::{seq::IteratorRandom, thread_rng, Rng};
 
 pub use crate::cluster_client::{ClusterClient, ClusterClientBuilder};
 pub use crate::cluster_pipeline::{cluster_pipe, ClusterPipeline};
+
+#[cfg(feature = "tls-rustls")]
+use crate::tls::TlsConnParams;
+
+#[cfg(not(feature = "tls-rustls"))]
+use crate::connection::TlsConnParams;
+
+#[derive(Clone)]
+enum Input<'a> {
+    Slice {
+        cmd: &'a [u8],
+        routable: Value,
+    },
+    Cmd(&'a Cmd),
+    Commands {
+        cmd: &'a [u8],
+        offset: usize,
+        count: usize,
+    },
+}
+
+impl<'a> Input<'a> {
+    fn send(&'a self, connection: &mut impl ConnectionLike) -> RedisResult<Output> {
+        match self {
+            Input::Slice { cmd, routable: _ } => connection
+                .req_packed_command(cmd)
+                .and_then(|value| value.extract_error())
+                .map(Output::Single),
+            Input::Cmd(cmd) => connection
+                .req_command(cmd)
+                .and_then(|value| value.extract_error())
+                .map(Output::Single),
+            Input::Commands { cmd, offset, count } => connection
+                .req_packed_commands(cmd, *offset, *count)
+                .and_then(Value::extract_error_vec)
+                .map(Output::Multi),
+        }
+    }
+}
+
+impl Routable for Input<'_> {
+    fn arg_idx(&self, idx: usize) -> Option<&[u8]> {
+        match self {
+            Input::Slice { cmd: _, routable } => routable.arg_idx(idx),
+            Input::Cmd(cmd) => cmd.arg_idx(idx),
+            Input::Commands { .. } => None,
+        }
+    }
+
+    fn position(&self, candidate: &[u8]) -> Option<usize> {
+        match self {
+            Input::Slice { cmd: _, routable } => routable.position(candidate),
+            Input::Cmd(cmd) => cmd.position(candidate),
+            Input::Commands { .. } => None,
+        }
+    }
+}
+
+enum Output {
+    Single(Value),
+    Multi(Vec<Value>),
+}
+
+impl From<Output> for Value {
+    fn from(value: Output) -> Self {
+        match value {
+            Output::Single(value) => value,
+            Output::Multi(values) => Value::Array(values),
+        }
+    }
+}
+
+impl From<Output> for Vec<Value> {
+    fn from(value: Output) -> Self {
+        match value {
+            Output::Single(value) => vec![value],
+            Output::Multi(values) => values,
+        }
+    }
+}
 
 /// Implements the process of connecting to a Redis server
 /// and obtaining and configuring a connection handle.
@@ -118,21 +228,18 @@ impl Connect for Connection {
     }
 }
 
-/// This represents a Redis Cluster connection. It stores the
-/// underlying connections maintained for each node in the cluster, as well
-/// as common parameters for connecting to nodes and executing commands.
+/// This represents a Redis Cluster connection.
+///
+/// It stores the underlying connections maintained for each node in the cluster,
+/// as well as common parameters for connecting to nodes and executing commands.
 pub struct ClusterConnection<C = Connection> {
     initial_nodes: Vec<ConnectionInfo>,
     connections: RefCell<HashMap<String, C>>,
     slots: RefCell<SlotMap>,
     auto_reconnect: RefCell<bool>,
-    read_from_replicas: bool,
-    username: Option<String>,
-    password: Option<String>,
     read_timeout: RefCell<Option<Duration>>,
     write_timeout: RefCell<Option<Duration>>,
-    tls: Option<TlsMode>,
-    retries: u32,
+    cluster_params: ClusterParams,
 }
 
 impl<C> ClusterConnection<C>
@@ -145,16 +252,12 @@ where
     ) -> RedisResult<Self> {
         let connection = Self {
             connections: RefCell::new(HashMap::new()),
-            slots: RefCell::new(SlotMap::new()),
+            slots: RefCell::new(SlotMap::new(cluster_params.read_from_replicas)),
             auto_reconnect: RefCell::new(true),
-            read_from_replicas: cluster_params.read_from_replicas,
-            username: cluster_params.username,
-            password: cluster_params.password,
-            read_timeout: RefCell::new(None),
+            read_timeout: RefCell::new(Some(cluster_params.response_timeout)),
             write_timeout: RefCell::new(None),
-            tls: cluster_params.tls,
             initial_nodes: initial_nodes.to_vec(),
-            retries: cluster_params.retries,
+            cluster_params,
         };
         connection.create_initial_connections()?;
 
@@ -226,7 +329,7 @@ where
 
     /// Returns the connection status.
     ///
-    /// The connection is open until any `read_response` call recieved an
+    /// The connection is open until any `read_response` call received an
     /// invalid response from the server (most likely a closed or dropped
     /// connection, otherwise a Redis protocol error). When using unix
     /// sockets the connection is open until writing a command failed with a
@@ -279,9 +382,6 @@ where
 
                 if let Ok(mut conn) = self.connect(addr) {
                     if conn.check_connection() {
-                        conn.set_read_timeout(*self.read_timeout.borrow()).unwrap();
-                        conn.set_write_timeout(*self.write_timeout.borrow())
-                            .unwrap();
                         return Some((addr.to_string(), conn));
                     }
                 }
@@ -296,49 +396,18 @@ where
     fn create_new_slots(&self) -> RedisResult<SlotMap> {
         let mut connections = self.connections.borrow_mut();
         let mut new_slots = None;
-        let mut rng = thread_rng();
-        let len = connections.len();
-        let mut samples = connections.values_mut().choose_multiple(&mut rng, len);
 
-        for conn in samples.iter_mut() {
+        for (addr, conn) in connections.iter_mut() {
             let value = conn.req_command(&slot_cmd())?;
-            if let Ok(mut slots_data) = parse_slots(value, self.tls) {
-                slots_data.sort_by_key(|s| s.start());
-                let last_slot = slots_data.iter().try_fold(0, |prev_end, slot_data| {
-                    if prev_end != slot_data.start() {
-                        return Err(RedisError::from((
-                            ErrorKind::ResponseError,
-                            "Slot refresh error.",
-                            format!(
-                                "Received overlapping slots {} and {}..{}",
-                                prev_end,
-                                slot_data.start(),
-                                slot_data.end()
-                            ),
-                        )));
-                    }
-                    Ok(slot_data.end() + 1)
-                })?;
-
-                if last_slot != SLOT_SIZE {
-                    return Err(RedisError::from((
-                        ErrorKind::ResponseError,
-                        "Slot refresh error.",
-                        format!("Lacks the slots >= {last_slot}"),
-                    )));
-                }
-
-                new_slots = Some(
-                    slots_data
-                        .iter()
-                        .map(|slot| {
-                            (
-                                slot.end(),
-                                SlotAddrs::from_slot(slot, self.read_from_replicas),
-                            )
-                        })
-                        .collect(),
-                );
+            if let Ok(slots_data) = parse_slots(
+                value,
+                self.cluster_params.tls,
+                addr.rsplit_once(':').unwrap().0,
+            ) {
+                new_slots = Some(SlotMap::from_slots(
+                    slots_data,
+                    self.cluster_params.read_from_replicas,
+                ));
                 break;
             }
         }
@@ -354,19 +423,16 @@ where
     }
 
     fn connect(&self, node: &str) -> RedisResult<C> {
-        let params = ClusterParams {
-            password: self.password.clone(),
-            username: self.username.clone(),
-            tls: self.tls,
-            ..Default::default()
-        };
+        let params = self.cluster_params.clone();
         let info = get_connection_info(node, params)?;
 
-        let mut conn = C::connect(info, None)?;
-        if self.read_from_replicas {
+        let mut conn = C::connect(info, Some(self.cluster_params.connection_timeout))?;
+        if self.cluster_params.read_from_replicas {
             // If READONLY is sent to primary nodes, it will have no effect
-            cmd("READONLY").query(&mut conn)?;
+            cmd("READONLY").exec(&mut conn)?;
         }
+        conn.set_read_timeout(*self.read_timeout.borrow())?;
+        conn.set_write_timeout(*self.write_timeout.borrow())?;
         Ok(conn)
     }
 
@@ -374,18 +440,17 @@ where
         &self,
         connections: &'a mut HashMap<String, C>,
         route: &Route,
-    ) -> RedisResult<(String, &'a mut C)> {
+    ) -> (String, RedisResult<&'a mut C>) {
         let slots = self.slots.borrow();
-        if let Some((_, slot_addrs)) = slots.range(route.slot()..).next() {
-            let addr = &slot_addrs.slot_addr(route.slot_addr());
-            Ok((
+        if let Some(addr) = slots.slot_addr_for_route(route) {
+            (
                 addr.to_string(),
-                self.get_connection_by_addr(connections, addr)?,
-            ))
+                self.get_connection_by_addr(connections, addr),
+            )
         } else {
             // try a random node next.  This is safe if slots are involved
             // as a wrong node would reject the request.
-            Ok(get_random_connection(connections, None))
+            get_random_connection_or_error(connections)
         }
     }
 
@@ -407,24 +472,24 @@ where
     fn get_addr_for_cmd(&self, cmd: &Cmd) -> RedisResult<String> {
         let slots = self.slots.borrow();
 
-        let addr_for_slot = |slot: u16, slot_addr: SlotAddr| -> RedisResult<String> {
-            let (_, slot_addrs) = slots
-                .range(&slot..)
-                .next()
+        let addr_for_slot = |route: Route| -> RedisResult<String> {
+            let slot_addr = slots
+                .slot_addr_for_route(&route)
                 .ok_or((ErrorKind::ClusterDown, "Missing slot coverage"))?;
-            Ok(slot_addrs.slot_addr(&slot_addr).to_string())
+            Ok(slot_addr.to_string())
         };
 
         match RoutingInfo::for_routable(cmd) {
-            Some(RoutingInfo::Random) => {
+            Some(RoutingInfo::SingleNode(SingleNodeRoutingInfo::Random)) => {
                 let mut rng = thread_rng();
-                Ok(addr_for_slot(
+                Ok(addr_for_slot(Route::new(
                     rng.gen_range(0..SLOT_SIZE),
                     SlotAddr::Master,
-                )?)
+                ))?)
             }
-            Some(RoutingInfo::MasterSlot(slot)) => Ok(addr_for_slot(slot, SlotAddr::Master)?),
-            Some(RoutingInfo::ReplicaSlot(slot)) => Ok(addr_for_slot(slot, SlotAddr::Replica)?),
+            Some(RoutingInfo::SingleNode(SingleNodeRoutingInfo::SpecificNode(route))) => {
+                Ok(addr_for_slot(route)?)
+            }
             _ => fail!(UNROUTABLE_ERROR),
         }
     }
@@ -448,108 +513,306 @@ where
         Ok(result)
     }
 
-    fn execute_on_all_nodes<T, F>(&self, mut func: F) -> RedisResult<T>
+    fn execute_on_all<'a>(
+        &'a self,
+        input: Input,
+        addresses: HashSet<&'a str>,
+    ) -> Vec<RedisResult<(&'a str, Value)>> {
+        addresses
+            .into_iter()
+            .map(|addr| {
+                let (host, port) = split_node_address(addr).unwrap();
+                self.request(
+                    input.clone(),
+                    Some(RoutingInfo::SingleNode(SingleNodeRoutingInfo::ByAddress {
+                        host: host.to_string(),
+                        port,
+                    })),
+                )
+                .map(|res| match res {
+                    Output::Single(value) => (addr, value),
+                    // technically this shouldn't be possible, but I prefer not to crash here.
+                    Output::Multi(values) => (addr, Value::Array(values)),
+                })
+            })
+            .collect()
+    }
+
+    fn execute_on_all_nodes<'a>(
+        &'a self,
+        input: Input,
+        slots: &'a mut SlotMap,
+    ) -> Vec<RedisResult<(&'a str, Value)>> {
+        self.execute_on_all(input, slots.addresses_for_all_nodes())
+    }
+
+    fn execute_on_all_primaries<'a>(
+        &'a self,
+        input: Input,
+        slots: &'a mut SlotMap,
+    ) -> Vec<RedisResult<(&'a str, Value)>> {
+        self.execute_on_all(input, slots.addresses_for_all_primaries())
+    }
+
+    fn execute_multi_slot<'a, 'b>(
+        &'a self,
+        input: Input,
+        slots: &'a mut SlotMap,
+        connections: &'a mut HashMap<String, C>,
+        routes: &'b [(Route, Vec<usize>)],
+    ) -> Vec<RedisResult<(&'a str, Value)>>
     where
-        T: MergeResults,
-        F: FnMut(&mut C) -> RedisResult<T>,
+        'b: 'a,
     {
+        slots
+            .addresses_for_multi_slot(routes)
+            .enumerate()
+            .map(|(index, addr)| {
+                let addr = addr.ok_or(RedisError::from((
+                    ErrorKind::IoError,
+                    "Couldn't find connection",
+                )))?;
+                let connection = self.get_connection_by_addr(connections, addr)?;
+                let (_, indices) = routes.get(index).unwrap();
+                let cmd =
+                    crate::cluster_routing::command_for_multi_slot_indices(&input, indices.iter());
+                connection.req_command(&cmd).map(|res| (addr, res))
+            })
+            .collect()
+    }
+
+    fn execute_on_multiple_nodes(
+        &self,
+        input: Input,
+        routing: MultipleNodeRoutingInfo,
+        response_policy: Option<ResponsePolicy>,
+    ) -> RedisResult<Value> {
         let mut connections = self.connections.borrow_mut();
-        let mut results = HashMap::new();
+        let mut slots = self.slots.borrow_mut();
 
-        // TODO: reconnect and shit
-        for (addr, connection) in connections.iter_mut() {
-            results.insert(addr.as_str(), func(connection)?);
+        let results = match &routing {
+            MultipleNodeRoutingInfo::MultiSlot(routes) => {
+                self.execute_multi_slot(input, &mut slots, &mut connections, routes)
+            }
+            MultipleNodeRoutingInfo::AllMasters => {
+                drop(connections);
+                self.execute_on_all_primaries(input, &mut slots)
+            }
+            MultipleNodeRoutingInfo::AllNodes => {
+                drop(connections);
+                self.execute_on_all_nodes(input, &mut slots)
+            }
+        };
+
+        match response_policy {
+            Some(ResponsePolicy::AllSucceeded) => {
+                let mut last_result = None;
+                for result in results {
+                    last_result = Some(result?);
+                }
+
+                last_result
+                    .ok_or(
+                        (
+                            ErrorKind::ClusterConnectionNotFound,
+                            "No results received for multi-node operation",
+                        )
+                            .into(),
+                    )
+                    .map(|(_, res)| res)
+            }
+            Some(ResponsePolicy::OneSucceeded) => {
+                let mut last_failure = None;
+
+                for result in results {
+                    match result {
+                        Ok((_, val)) => return Ok(val),
+                        Err(err) => last_failure = Some(err),
+                    }
+                }
+
+                Err(last_failure
+                    .unwrap_or_else(|| (ErrorKind::IoError, "Couldn't find a connection").into()))
+            }
+            Some(ResponsePolicy::OneSucceededNonEmpty) => {
+                let mut last_failure = None;
+
+                for result in results {
+                    match result.map(|(_, res)| res) {
+                        Ok(Value::Nil) => continue,
+                        Ok(val) => return Ok(val),
+                        Err(err) => last_failure = Some(err),
+                    }
+                }
+                Err(last_failure
+                    .unwrap_or_else(|| (ErrorKind::IoError, "Couldn't find a connection").into()))
+            }
+            Some(ResponsePolicy::Aggregate(op)) => {
+                let results = results
+                    .into_iter()
+                    .map(|res| res.map(|(_, val)| val))
+                    .collect::<RedisResult<Vec<_>>>()?;
+                crate::cluster_routing::aggregate(results, op)
+            }
+            Some(ResponsePolicy::AggregateLogical(op)) => {
+                let results = results
+                    .into_iter()
+                    .map(|res| res.map(|(_, val)| val))
+                    .collect::<RedisResult<Vec<_>>>()?;
+                crate::cluster_routing::logical_aggregate(results, op)
+            }
+            Some(ResponsePolicy::CombineArrays) => {
+                let results = results
+                    .into_iter()
+                    .map(|res| res.map(|(_, val)| val))
+                    .collect::<RedisResult<Vec<_>>>()?;
+                match routing {
+                    MultipleNodeRoutingInfo::MultiSlot(vec) => {
+                        crate::cluster_routing::combine_and_sort_array_results(
+                            results,
+                            vec.iter().map(|(_, indices)| indices),
+                        )
+                    }
+                    _ => crate::cluster_routing::combine_array_results(results),
+                }
+            }
+            Some(ResponsePolicy::Special) | None => {
+                // This is our assumption - if there's no coherent way to aggregate the responses, we just map each response to the sender, and pass it to the user.
+                // TODO - once Value::Error is merged, we can use join_all and report separate errors and also pass successes.
+                let results = results
+                    .into_iter()
+                    .map(|result| {
+                        result.map(|(addr, val)| (Value::BulkString(addr.as_bytes().to_vec()), val))
+                    })
+                    .collect::<RedisResult<Vec<_>>>()?;
+                Ok(Value::Map(results))
+            }
         }
-
-        Ok(T::merge_results(results))
     }
 
     #[allow(clippy::unnecessary_unwrap)]
-    fn request<R, T, F>(&self, cmd: &R, mut func: F) -> RedisResult<T>
-    where
-        R: ?Sized + Routable,
-        T: MergeResults + std::fmt::Debug,
-        F: FnMut(&mut C) -> RedisResult<T>,
-    {
-        let route = match RoutingInfo::for_routable(cmd) {
-            Some(RoutingInfo::Random) => None,
-            Some(RoutingInfo::MasterSlot(slot)) => Some(Route::new(slot, SlotAddr::Master)),
-            Some(RoutingInfo::ReplicaSlot(slot)) => Some(Route::new(slot, SlotAddr::Replica)),
-            Some(RoutingInfo::AllNodes) | Some(RoutingInfo::AllMasters) => {
-                return self.execute_on_all_nodes(func);
+    fn request(&self, input: Input, route_option: Option<RoutingInfo>) -> RedisResult<Output> {
+        let single_node_routing = match route_option {
+            Some(RoutingInfo::SingleNode(single_node_routing)) => single_node_routing,
+            Some(RoutingInfo::MultiNode((multi_node_routing, response_policy))) => {
+                return self
+                    .execute_on_multiple_nodes(input, multi_node_routing, response_policy)
+                    .map(Output::Single);
             }
             None => fail!(UNROUTABLE_ERROR),
         };
 
-        let mut retries = self.retries;
-        let mut excludes = HashSet::new();
-        let mut redirected = None::<String>;
-        let mut is_asking = false;
+        let mut retries = 0;
+        let mut redirected = None::<Redirect>;
+
         loop {
             // Get target address and response.
             let (addr, rv) = {
                 let mut connections = self.connections.borrow_mut();
-                let (addr, conn) = if let Some(addr) = redirected.take() {
-                    let conn = self.get_connection_by_addr(&mut connections, &addr)?;
+                let (addr, conn) = if let Some(redirected) = redirected.take() {
+                    let (addr, is_asking) = match redirected {
+                        Redirect::Moved(addr) => (addr, false),
+                        Redirect::Ask(addr) => (addr, true),
+                    };
+                    let mut conn = self.get_connection_by_addr(&mut connections, &addr);
                     if is_asking {
                         // if we are in asking mode we want to feed a single
                         // ASKING command into the connection before what we
                         // actually want to execute.
-                        conn.req_packed_command(&b"*1\r\n$6\r\nASKING\r\n"[..])?;
-                        is_asking = false;
+                        conn = conn.and_then(|conn| {
+                            conn.req_packed_command(&b"*1\r\n$6\r\nASKING\r\n"[..])
+                                .and_then(|value| value.extract_error())?;
+                            Ok(conn)
+                        });
                     }
-                    (addr.to_string(), conn)
-                } else if !excludes.is_empty() || route.is_none() {
-                    get_random_connection(&mut connections, Some(&excludes))
+                    (addr, conn)
                 } else {
-                    self.get_connection(&mut connections, route.as_ref().unwrap())?
+                    match &single_node_routing {
+                        SingleNodeRoutingInfo::Random => {
+                            get_random_connection_or_error(&mut connections)
+                        }
+                        SingleNodeRoutingInfo::SpecificNode(route) => {
+                            self.get_connection(&mut connections, route)
+                        }
+                        SingleNodeRoutingInfo::ByAddress { host, port } => {
+                            let address = format!("{host}:{port}");
+                            let conn = self.get_connection_by_addr(&mut connections, &address);
+                            (address, conn)
+                        }
+                    }
                 };
-                (addr, func(conn))
+                (addr, conn.and_then(|conn| input.send(conn)))
             };
 
             match rv {
                 Ok(rv) => return Ok(rv),
                 Err(err) => {
-                    if retries == 0 {
+                    if err.kind() == ErrorKind::ClusterConnectionNotFound
+                        && *self.auto_reconnect.borrow()
+                    {
+                        for node in &self.initial_nodes {
+                            let addr = node.addr.to_string();
+                            if let Ok(mut conn) = self.connect(&addr) {
+                                if conn.check_connection() {
+                                    self.connections.borrow_mut().insert(addr, conn);
+                                }
+                            }
+                        }
+                        self.refresh_slots()?;
+                    }
+
+                    if retries == self.cluster_params.retry_params.number_of_retries {
                         return Err(err);
                     }
-                    retries -= 1;
+                    retries += 1;
 
-                    if err.is_cluster_error() {
-                        let kind = err.kind();
-
-                        if kind == ErrorKind::Ask {
-                            redirected = err.redirect_node().map(|(node, _slot)| node.to_string());
-                            is_asking = true;
-                        } else if kind == ErrorKind::Moved {
+                    match err.retry_method() {
+                        crate::types::RetryMethod::AskRedirect => {
+                            redirected = err
+                                .redirect_node()
+                                .map(|(node, _slot)| Redirect::Ask(node.to_string()));
+                        }
+                        crate::types::RetryMethod::MovedRedirect => {
                             // Refresh slots.
                             self.refresh_slots()?;
-                            excludes.clear();
-
                             // Request again.
-                            redirected = err.redirect_node().map(|(node, _slot)| node.to_string());
-                            is_asking = false;
-                            continue;
-                        } else if kind == ErrorKind::TryAgain || kind == ErrorKind::ClusterDown {
-                            // Sleep and retry.
-                            let sleep_time = 2u64.pow(16 - retries.max(9)) * 10;
-                            thread::sleep(Duration::from_millis(sleep_time));
-                            excludes.clear();
-                            continue;
+                            redirected = err
+                                .redirect_node()
+                                .map(|(node, _slot)| Redirect::Moved(node.to_string()));
                         }
-                    } else if *self.auto_reconnect.borrow() && err.is_io_error() {
-                        self.create_initial_connections()?;
-                        excludes.clear();
-                        continue;
-                    } else {
-                        return Err(err);
-                    }
-
-                    excludes.insert(addr);
-
-                    let connections = self.connections.borrow();
-                    if excludes.len() >= connections.len() {
-                        return Err(err);
+                        crate::types::RetryMethod::WaitAndRetry => {
+                            // Sleep and retry.
+                            let sleep_time = self
+                                .cluster_params
+                                .retry_params
+                                .wait_time_for_retry(retries);
+                            thread::sleep(sleep_time);
+                        }
+                        crate::types::RetryMethod::Reconnect => {
+                            if *self.auto_reconnect.borrow() {
+                                // if the connection is no longer valid, we should remove it.
+                                self.connections.borrow_mut().remove(&addr);
+                                if let Ok(mut conn) = self.connect(&addr) {
+                                    if conn.check_connection() {
+                                        self.connections.borrow_mut().insert(addr, conn);
+                                    }
+                                }
+                            }
+                        }
+                        crate::types::RetryMethod::NoRetry => {
+                            return Err(err);
+                        }
+                        crate::types::RetryMethod::RetryImmediately => {}
+                        crate::types::RetryMethod::ReconnectFromInitialConnections => {
+                            // TODO - implement reconnect from initial connections
+                            if *self.auto_reconnect.borrow() {
+                                if let Ok(mut conn) = self.connect(&addr) {
+                                    if conn.check_connection() {
+                                        self.connections.borrow_mut().insert(addr, conn);
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -574,11 +837,12 @@ where
         self.refresh_slots()?;
 
         // Given that there are commands that need to be retried, it means something in the cluster
-        // topology changed. Execute each command seperately to take advantage of the existing
+        // topology changed. Execute each command separately to take advantage of the existing
         // retry logic that handles these cases.
         for retry_idx in to_retry {
             let cmd = &cmds[retry_idx];
-            results[retry_idx] = self.request(cmd, move |conn| conn.req_command(cmd))?;
+            let routing = RoutingInfo::for_routable(cmd);
+            results[retry_idx] = self.request(Input::Cmd(cmd), routing)?.into();
         }
         Ok(results)
     }
@@ -622,20 +886,41 @@ where
             None => Ok(to_retry),
         }
     }
+
+    /// Send a command to the given `routing`.
+    pub fn route_command(&mut self, cmd: &Cmd, routing: RoutingInfo) -> RedisResult<Value> {
+        self.request(Input::Cmd(cmd), Some(routing))
+            .map(|res| res.into())
+    }
 }
 
+const MULTI: &[u8] = "*1\r\n$5\r\nMULTI\r\n".as_bytes();
 impl<C: Connect + ConnectionLike> ConnectionLike for ClusterConnection<C> {
     fn supports_pipelining(&self) -> bool {
         false
     }
 
     fn req_command(&mut self, cmd: &Cmd) -> RedisResult<Value> {
-        self.request(cmd, move |conn| conn.req_command(cmd))
+        let routing = RoutingInfo::for_routable(cmd);
+        self.request(Input::Cmd(cmd), routing).map(|res| res.into())
     }
 
     fn req_packed_command(&mut self, cmd: &[u8]) -> RedisResult<Value> {
-        let value = parse_redis_value(cmd)?;
-        self.request(&value, move |conn| conn.req_packed_command(cmd))
+        let actual_cmd = if cmd.starts_with(MULTI) {
+            &cmd[MULTI.len()..]
+        } else {
+            cmd
+        };
+        let value = parse_redis_value(actual_cmd)?;
+        let routing = RoutingInfo::for_routable(&value);
+        self.request(
+            Input::Slice {
+                cmd,
+                routable: value,
+            },
+            routing,
+        )
+        .map(|res| res.into())
     }
 
     fn req_packed_commands(
@@ -644,10 +929,24 @@ impl<C: Connect + ConnectionLike> ConnectionLike for ClusterConnection<C> {
         offset: usize,
         count: usize,
     ) -> RedisResult<Vec<Value>> {
-        let value = parse_redis_value(cmd)?;
-        self.request(&value, move |conn| {
-            conn.req_packed_commands(cmd, offset, count)
-        })
+        let actual_cmd = if cmd.starts_with(MULTI) {
+            &cmd[MULTI.len()..]
+        } else {
+            cmd
+        };
+        let value = parse_redis_value(actual_cmd)?;
+        let route = match RoutingInfo::for_routable(&value) {
+            // we don't allow routing multiple commands to multiple nodes.
+            Some(RoutingInfo::MultiNode(_)) => None,
+            Some(RoutingInfo::SingleNode(route)) => Some(route),
+            None => None,
+        }
+        .unwrap_or(SingleNodeRoutingInfo::Random);
+        self.request(
+            Input::Commands { cmd, offset, count },
+            Some(RoutingInfo::SingleNode(route)),
+        )
+        .map(|res| res.into())
     }
 
     fn get_db(&self) -> i64 {
@@ -675,31 +974,6 @@ impl<C: Connect + ConnectionLike> ConnectionLike for ClusterConnection<C> {
     }
 }
 
-trait MergeResults {
-    fn merge_results(_values: HashMap<&str, Self>) -> Self
-    where
-        Self: Sized;
-}
-
-impl MergeResults for Value {
-    fn merge_results(values: HashMap<&str, Value>) -> Value {
-        let mut items = vec![];
-        for (addr, value) in values.into_iter() {
-            items.push(Value::Bulk(vec![
-                Value::Data(addr.as_bytes().to_vec()),
-                value,
-            ]));
-        }
-        Value::Bulk(items)
-    }
-}
-
-impl MergeResults for Vec<Value> {
-    fn merge_results(_values: HashMap<&str, Vec<Value>>) -> Vec<Value> {
-        unreachable!("attempted to merge a pipeline. This should not happen");
-    }
-}
-
 #[derive(Debug)]
 struct NodeCmd {
     // The original command indexes
@@ -718,99 +992,28 @@ impl NodeCmd {
     }
 }
 
-/// TlsMode indicates use or do not use verification of certification.
-/// Check [ConnectionAddr](ConnectionAddr::TcpTls::insecure) for more.
-#[derive(Clone, Copy)]
-pub enum TlsMode {
-    /// Secure verify certification.
-    Secure,
-    /// Insecure do not verify certification.
-    Insecure,
+fn get_random_connection<C: ConnectionLike + Connect + Sized>(
+    connections: &mut HashMap<String, C>,
+) -> Option<(String, &mut C)> {
+    let addr = connections.keys().choose(&mut thread_rng())?.to_string();
+    let conn = connections.get_mut(&addr)?;
+    Some((addr, conn))
 }
 
-fn get_random_connection<'a, C: ConnectionLike + Connect + Sized>(
-    connections: &'a mut HashMap<String, C>,
-    excludes: Option<&'a HashSet<String>>,
-) -> (String, &'a mut C) {
-    let mut rng = thread_rng();
-    let addr = match excludes {
-        Some(excludes) if excludes.len() < connections.len() => connections
-            .keys()
-            .filter(|key| !excludes.contains(*key))
-            .choose(&mut rng)
-            .unwrap()
-            .to_string(),
-        _ => connections.keys().choose(&mut rng).unwrap().to_string(),
-    };
-
-    let con = connections.get_mut(&addr).unwrap();
-    (addr, con)
-}
-
-// Parse slot data from raw redis value.
-pub(crate) fn parse_slots(raw_slot_resp: Value, tls: Option<TlsMode>) -> RedisResult<Vec<Slot>> {
-    // Parse response.
-    let mut result = Vec::with_capacity(2);
-
-    if let Value::Bulk(items) = raw_slot_resp {
-        let mut iter = items.into_iter();
-        while let Some(Value::Bulk(item)) = iter.next() {
-            if item.len() < 3 {
-                continue;
-            }
-
-            let start = if let Value::Int(start) = item[0] {
-                start as u16
-            } else {
-                continue;
-            };
-
-            let end = if let Value::Int(end) = item[1] {
-                end as u16
-            } else {
-                continue;
-            };
-
-            let mut nodes: Vec<String> = item
-                .into_iter()
-                .skip(2)
-                .filter_map(|node| {
-                    if let Value::Bulk(node) = node {
-                        if node.len() < 2 {
-                            return None;
-                        }
-
-                        let ip = if let Value::Data(ref ip) = node[0] {
-                            String::from_utf8_lossy(ip)
-                        } else {
-                            return None;
-                        };
-                        if ip.is_empty() {
-                            return None;
-                        }
-
-                        let port = if let Value::Int(port) = node[1] {
-                            port as u16
-                        } else {
-                            return None;
-                        };
-                        Some(get_connection_addr(ip.into_owned(), port, tls).to_string())
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-
-            if nodes.is_empty() {
-                continue;
-            }
-
-            let replicas = nodes.split_off(1);
-            result.push(Slot::new(start, end, nodes.pop().unwrap(), replicas));
-        }
+fn get_random_connection_or_error<C: ConnectionLike + Connect + Sized>(
+    connections: &mut HashMap<String, C>,
+) -> (String, RedisResult<&mut C>) {
+    match get_random_connection(connections) {
+        Some((addr, conn)) => (addr, Ok(conn)),
+        None => (
+            // we need to add a fake address in order for the error to be handled - the code that uses it assumes there's an address attached.
+            String::new(),
+            Err(RedisError::from((
+                ErrorKind::ClusterConnectionNotFound,
+                "No connections found",
+            ))),
+        ),
     }
-
-    Ok(result)
 }
 
 // The node string passed to this function will always be in the format host:port as it is either:
@@ -820,38 +1023,50 @@ pub(crate) fn get_connection_info(
     node: &str,
     cluster_params: ClusterParams,
 ) -> RedisResult<ConnectionInfo> {
-    let invalid_error = || (ErrorKind::InvalidClientConfig, "Invalid node string");
-
-    let (host, port) = node
-        .rsplit_once(':')
-        .and_then(|(host, port)| {
-            Some(host.trim_start_matches('[').trim_end_matches(']'))
-                .filter(|h| !h.is_empty())
-                .zip(u16::from_str(port).ok())
-        })
-        .ok_or_else(invalid_error)?;
+    let (host, port) = split_node_address(node)?;
 
     Ok(ConnectionInfo {
-        addr: get_connection_addr(host.to_string(), port, cluster_params.tls),
+        addr: get_connection_addr(host, port, cluster_params.tls, cluster_params.tls_params),
         redis: RedisConnectionInfo {
             password: cluster_params.password,
             username: cluster_params.username,
-            ..Default::default()
+            protocol: cluster_params.protocol.unwrap_or_default(),
+            db: 0,
         },
     })
 }
 
-fn get_connection_addr(host: String, port: u16, tls: Option<TlsMode>) -> ConnectionAddr {
+fn split_node_address(node: &str) -> RedisResult<(String, u16)> {
+    let invalid_error =
+        || RedisError::from((ErrorKind::InvalidClientConfig, "Invalid node string"));
+    node.rsplit_once(':')
+        .and_then(|(host, port)| {
+            Some(host.trim_start_matches('[').trim_end_matches(']'))
+                .filter(|h| !h.is_empty())
+                .map(str::to_string)
+                .zip(u16::from_str(port).ok())
+        })
+        .ok_or_else(invalid_error)
+}
+
+pub(crate) fn get_connection_addr(
+    host: String,
+    port: u16,
+    tls: Option<TlsMode>,
+    tls_params: Option<TlsConnParams>,
+) -> ConnectionAddr {
     match tls {
         Some(TlsMode::Secure) => ConnectionAddr::TcpTls {
             host,
             port,
             insecure: false,
+            tls_params,
         },
         Some(TlsMode::Insecure) => ConnectionAddr::TcpTls {
             host,
             port,
             insecure: true,
+            tls_params,
         },
         _ => ConnectionAddr::Tcp(host, port),
     }

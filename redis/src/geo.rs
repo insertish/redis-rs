@@ -43,8 +43,9 @@ impl ToRedisArgs for Unit {
     }
 }
 
-/// A coordinate (longitude, latitude). Can be used with [`geo_pos`][1]
-/// to parse response from Redis.
+/// A coordinate (longitude, latitude).
+///
+/// Can be used with [`geo_pos`][1] to parse response from Redis.
 ///
 /// [1]: ../trait.Commands.html#method.geo_pos
 ///
@@ -95,8 +96,8 @@ impl<T: ToRedisArgs> ToRedisArgs for Coord<T> {
         ToRedisArgs::write_redis_args(&self.latitude, out);
     }
 
-    fn is_single_arg(&self) -> bool {
-        false
+    fn num_of_args(&self) -> usize {
+        2
     }
 }
 
@@ -104,8 +105,10 @@ impl<T: ToRedisArgs> ToRedisArgs for Coord<T> {
 ///
 /// [1]: https://redis.io/commands/georadius
 /// [2]: https://redis.io/commands/georadiusbymember
+#[derive(Default)]
 pub enum RadiusOrder {
     /// Don't sort the results
+    #[default]
     Unsorted,
 
     /// Sort returned items from the nearest to the farthest, relative to the center.
@@ -113,12 +116,6 @@ pub enum RadiusOrder {
 
     /// Sort returned items from the farthest to the nearest, relative to the center.
     Desc,
-}
-
-impl Default for RadiusOrder {
-    fn default() -> RadiusOrder {
-        RadiusOrder::Unsorted
-    }
 }
 
 /// Options for the [GEORADIUS][1] and [GEORADIUSBYMEMBER][2] commands
@@ -237,8 +234,29 @@ impl ToRedisArgs for RadiusOptions {
         }
     }
 
-    fn is_single_arg(&self) -> bool {
-        false
+    fn num_of_args(&self) -> usize {
+        let mut n: usize = 0;
+        if self.with_coord {
+            n += 1;
+        }
+        if self.with_dist {
+            n += 1;
+        }
+        if self.count.is_some() {
+            n += 2;
+        }
+        match self.order {
+            RadiusOrder::Asc => n += 1,
+            RadiusOrder::Desc => n += 1,
+            _ => {}
+        };
+        if self.store.is_some() {
+            n += 1 + self.store.as_ref().unwrap().len();
+        }
+        if self.store_dist.is_some() {
+            n += 1 + self.store_dist.as_ref().unwrap().len();
+        }
+        n
     }
 }
 
@@ -267,7 +285,7 @@ impl FromRedisValue for RadiusSearchResult {
         }
 
         // Try to parse the result from multitple values
-        if let Value::Bulk(ref items) = *v {
+        if let Value::Array(ref items) = *v {
             if let Some(result) = RadiusSearchResult::parse_multi_values(items) {
                 return Ok(result);
             }

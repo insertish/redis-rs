@@ -147,7 +147,7 @@ impl<'a> ScriptInvocation<'a> {
             Ok(val) => Ok(val),
             Err(err) => {
                 if err.kind() == ErrorKind::NoScriptError {
-                    self.load_cmd().query(con)?;
+                    self.load_cmd().exec(con)?;
                     eval_cmd.query(con)
                 } else {
                     Err(err)
@@ -159,11 +159,10 @@ impl<'a> ScriptInvocation<'a> {
     /// Asynchronously invokes the script and returns the result.
     #[inline]
     #[cfg(feature = "aio")]
-    pub async fn invoke_async<C, T>(&self, con: &mut C) -> RedisResult<T>
-    where
-        C: crate::aio::ConnectionLike,
-        T: FromRedisValue,
-    {
+    pub async fn invoke_async<T: FromRedisValue>(
+        &self,
+        con: &mut impl crate::aio::ConnectionLike,
+    ) -> RedisResult<T> {
         let eval_cmd = self.eval_cmd();
         match eval_cmd.query_async(con).await {
             Ok(val) => {
@@ -173,7 +172,7 @@ impl<'a> ScriptInvocation<'a> {
             Err(err) => {
                 // Load the script into Redis if the script hash wasn't there already
                 if err.kind() == ErrorKind::NoScriptError {
-                    self.load_cmd().query_async(con).await?;
+                    self.load_cmd().exec_async(con).await?;
                     eval_cmd.query_async(con).await
                 } else {
                     Err(err)
@@ -206,18 +205,52 @@ impl<'a> ScriptInvocation<'a> {
         Ok(hash)
     }
 
+    /// Returns a command to load the script.
     fn load_cmd(&self) -> Cmd {
         let mut cmd = cmd("SCRIPT");
         cmd.arg("LOAD").arg(self.script.code.as_bytes());
         cmd
     }
 
-    fn eval_cmd(&self) -> Cmd {
-        let mut cmd = cmd("EVALSHA");
-        cmd.arg(self.script.hash.as_bytes())
+    fn estimate_buflen(&self) -> usize {
+        self
+            .keys
+            .iter()
+            .chain(self.args.iter())
+            .fold(0, |acc, e| acc + e.len())
+            + 7 /* "EVALSHA".len() */
+            + self.script.hash.len()
+            + 4 /* Slots reserved for the length of keys. */
+    }
+
+    /// Returns a command to evaluate the command.
+    pub(crate) fn eval_cmd(&self) -> Cmd {
+        let args_len = 3 + self.keys.len() + self.args.len();
+        let mut cmd = Cmd::with_capacity(args_len, self.estimate_buflen());
+        cmd.arg("EVALSHA")
+            .arg(self.script.hash.as_bytes())
             .arg(self.keys.len())
             .arg(&*self.keys)
             .arg(&*self.args);
         cmd
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Script;
+
+    #[test]
+    fn script_eval_should_work() {
+        let script = Script::new("return KEYS[1]");
+        let invocation = script.key("dummy");
+        let estimated_buflen = invocation.estimate_buflen();
+        let cmd = invocation.eval_cmd();
+        assert!(estimated_buflen >= cmd.capacity().1);
+        let expected = "*4\r\n$7\r\nEVALSHA\r\n$40\r\n4a2267357833227dd98abdedb8cf24b15a986445\r\n$1\r\n1\r\n$5\r\ndummy\r\n";
+        assert_eq!(
+            expected,
+            std::str::from_utf8(cmd.get_packed_command().as_slice()).unwrap()
+        );
     }
 }
